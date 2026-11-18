@@ -45,7 +45,10 @@ class State:
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts INTEGER, kind TEXT, data TEXT)"
             )
             self._migrate()
-            # Secondary indexes go after _migrate(): a legacy table may not have the columns yet
+            # Secondary indexes go after _migrate(): a legacy table may not have the columns yet,
+            # and the rides rebuild above drops any index made before it. Per-user session dedupe:
+            # two users may share one Garmin account — each gets the post.
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uix_rides_user_session ON rides(user_id, session_id)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_rides_user ON rides(user_id, started_ts)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_user_ts ON events(user_id, ts DESC)")
             self.db.commit()
@@ -75,12 +78,29 @@ class State:
                 "CREATE UNIQUE INDEX uix_users_email_token ON users(email_token) "
                 "WHERE email_token IS NOT NULL"
             )
-        idx_rides = {r[1] for r in self.db.execute("PRAGMA index_list(rides)")}
-        if "uix_rides_user_session" not in idx_rides:
-            # per-user session dedupe: two users may share one Garmin account — each gets the post
+        seen_cols = {r[1] for r in self.db.execute("PRAGMA table_info(seen)")}
+        if "user_id" not in seen_cols:
+            self.db.execute("ALTER TABLE seen ADD COLUMN user_id INTEGER")
+        # A pre-per-user-dedupe rides table carries a table-level UNIQUE(session_id): SQLite cannot
+        # drop a constraint in place, so rebuild the table (copy keeps every row; the per-user
+        # unique index is created after the rebuild — an index made before it would die with the
+        # dropped table).
+        rides_sql = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='rides'"
+        ).fetchone()
+        if rides_sql and "session_id TEXT UNIQUE" in (rides_sql[0] or ""):
+            self.db.execute("CREATE TABLE rides_new ("
+                            "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT, "
+                            "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, state TEXT DEFAULT 'started', "
+                            "channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)")
+            legacy_cols = [r[1] for r in self.db.execute("PRAGMA table_info(rides)")]
+            shared = [c for c in ("ride_id", "user_id", "session_id", "live_url", "started_ts",
+                                  "ended_ts", "state", "channel_msg_id", "discuss_msg_id",
+                                  "activity_id") if c in legacy_cols]
             self.db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uix_rides_user_session ON rides(user_id, session_id)"
-            )
+                f"INSERT INTO rides_new ({', '.join(shared)}) SELECT {', '.join(shared)} FROM rides")
+            self.db.execute("DROP TABLE rides")
+            self.db.execute("ALTER TABLE rides_new RENAME TO rides")
         rides_cols = {r[1] for r in self.db.execute("PRAGMA table_info(rides)")}
         for name, ddl in (
             ("started_ts", "INTEGER"),
@@ -260,22 +280,22 @@ class State:
             row = self.db.execute("SELECT * FROM rides WHERE session_id=?", (str(session_id),)).fetchone()
             return dict(row) if row else None
 
-    def set_channel_msg(self, session_id: str, channel_msg_id: int) -> bool:
+    def set_channel_msg(self, user_id: int, session_id: str, channel_msg_id: int) -> bool:
         """Attach the announcement post in the user's target chat to the ride."""
         with self._lock:
             cur = self.db.execute(
-                "UPDATE rides SET channel_msg_id=? WHERE session_id=? AND channel_msg_id IS NULL",
-                (int(channel_msg_id), str(session_id)),
+                "UPDATE rides SET channel_msg_id=? WHERE user_id=? AND session_id=? AND channel_msg_id IS NULL",
+                (int(channel_msg_id), int(user_id), str(session_id)),
             )
             self.db.commit()
             return cur.rowcount > 0
 
-    def set_discuss_msg(self, session_id: str, discuss_msg_id: int) -> bool:
+    def set_discuss_msg(self, user_id: int, session_id: str, discuss_msg_id: int) -> bool:
         """Attach the auto-forwarded copy in the linked discussion group (the thread root)."""
         with self._lock:
             cur = self.db.execute(
-                "UPDATE rides SET discuss_msg_id=? WHERE session_id=? AND discuss_msg_id IS NULL",
-                (int(discuss_msg_id), str(session_id)),
+                "UPDATE rides SET discuss_msg_id=? WHERE user_id=? AND session_id=? AND discuss_msg_id IS NULL",
+                (int(discuss_msg_id), int(user_id), str(session_id)),
             )
             self.db.commit()
             return cur.rowcount > 0
@@ -310,11 +330,12 @@ class State:
             self.db.commit()
             return cur.rowcount > 0
 
-    def set_activity(self, session_id: str, activity_id: str) -> None:
+    def set_activity(self, user_id: int, session_id: str, activity_id: str) -> None:
         """Store the matched Garmin activity id (ride-end matching, photo albums)."""
         with self._lock:
             self.db.execute(
-                "UPDATE rides SET activity_id=? WHERE session_id=?", (str(activity_id), str(session_id))
+                "UPDATE rides SET activity_id=? WHERE user_id=? AND session_id=?",
+                (str(activity_id), int(user_id), str(session_id)),
             )
             self.db.commit()
 

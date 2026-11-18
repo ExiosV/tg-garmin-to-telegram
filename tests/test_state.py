@@ -87,7 +87,7 @@ def test_discussion_lookup_helpers(tmp_path):
     st.start_ride(1, "s1", "u", 501, 100)   # announced, no thread yet: listed
     st.start_ride(1, "s2", "u", None, 100)  # not announced yet: excluded
     st.start_ride(1, "s3", "u", 502, 100)   # announced and already linked: excluded
-    st.set_discuss_msg("s3", 900)
+    st.set_discuss_msg(1, "s3", 900)
     st.start_ride(2, "s4", "u", 501, 100)   # another chat may hold the same message id
     assert st.ride_by_channel_msg(1, 501)["session_id"] == "s1"
     assert st.ride_by_channel_msg(1, 502)["session_id"] == "s3"
@@ -95,17 +95,17 @@ def test_discussion_lookup_helpers(tmp_path):
     assert st.ride_by_channel_msg(1, 404) is None
     assert [r["session_id"] for r in st.unlinked_discussion_rides(1)] == ["s1"]
     assert [r["session_id"] for r in st.unlinked_discussion_rides(2)] == ["s4"]
-    st.set_discuss_msg("s1", 901)
+    st.set_discuss_msg(1, "s1", 901)
     assert st.unlinked_discussion_rides(1) == []
 
 
 def test_ride_lifecycle(tmp_path):
     st = State(str(tmp_path))
     st.start_ride(1, "s1", "https://livetrack.garmin.com/session/s1", started_ts=100)
-    assert st.set_channel_msg("s1", 555) is True
-    assert st.set_channel_msg("s1", 556) is False  # already attached, never overwritten
-    assert st.set_discuss_msg("s1", 777) is True
-    st.set_activity("s1", "garmin-987")
+    assert st.set_channel_msg(1, "s1", 555) is True
+    assert st.set_channel_msg(1, "s1", 556) is False  # already attached, never overwritten
+    assert st.set_discuss_msg(1, "s1", 777) is True
+    st.set_activity(1, "s1", "garmin-987")
     assert st.set_ride_end("s1", 200) is True
     assert st.set_ride_end("s1", 300) is False  # only a 'started' ride transitions
     ride = st.get_ride("s1")
@@ -167,6 +167,27 @@ def test_migrate_adds_missing_columns_to_legacy_db(tmp_path):
     st.set_email_link(1, "tok", "x@example.com")  # migrated columns are usable
     st.set_user_state(1, "active")
     assert st.user_by_email_token("tok")["user_id"] == 1
+
+
+def test_upgrade_from_base_commit_schema(tmp_path):
+    """The 5fb5b91 schema (seen without user_id, rides with a table-level UNIQUE(session_id))
+    must migrate cleanly: the column is added, the constraint is rebuilt per user."""
+    legacy = sqlite3.connect(tmp_path / "state.db")
+    legacy.execute("CREATE TABLE seen (mail_id TEXT PRIMARY KEY, link TEXT, ts INTEGER)")
+    legacy.execute(
+        "CREATE TABLE rides (ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, "
+        "session_id TEXT UNIQUE, live_url TEXT, started_ts INTEGER, ended_ts INTEGER, "
+        "state TEXT DEFAULT 'started', channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)"
+    )
+    legacy.commit()
+    legacy.close()
+    st = State(str(tmp_path))
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/s1", user_id=7)  # no OperationalError
+    assert st.link_seen("https://livetrack.garmin.com/session/s1", 7)
+    st.touch_user(7)
+    st.touch_user(8)
+    assert st.start_ride(7, "s1", "https://livetrack.garmin.com/session/s1", started_ts=10)
+    assert st.start_ride(8, "s1", "https://livetrack.garmin.com/session/s1", started_ts=10)  # rebuilt: no legacy UNIQUE
 
 
 def test_migration_is_idempotent(tmp_path):

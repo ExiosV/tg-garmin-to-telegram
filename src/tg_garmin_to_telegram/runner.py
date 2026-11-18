@@ -88,9 +88,9 @@ def _pending_marks(state) -> dict:
 
 
 def _retry_pending_marks(state, pending: dict) -> None:
-    for mid, canonical in list(pending.items()):
+    for mid, (canonical, user_id) in list(pending.items()):
         try:
-            state.mark_seen(mid, canonical)
+            state.mark_seen(mid, canonical, user_id)
         except Exception as e:  # reads may work while writes fail; retry at the next cycle
             log.warning("could not mark mail %s as sent (will retry): %s", mid, redact(e))
             continue
@@ -166,7 +166,7 @@ def _process_mail(cfg, gmail, telegram_factory, state, pending: dict, mid, first
         raise  # transient (429, 5xx, network): leave unseen, retry next pass; other mails proceed
     posted = 1
     # Mark first: a bookkeeping failure below must never leave the mail unseen and re-post the ride.
-    pending[mid] = canonical
+    pending[mid] = (canonical, user["user_id"])
     try:
         state.mark_seen(mid, canonical, user["user_id"])
         del pending[mid]
@@ -226,7 +226,7 @@ def _poll_user_discussion(telegram_factory, state, user: dict, wait: int = 1) ->
             log.warning("auto-forward of announcement %s has no matching ride (user %s); "
                         "the thread link is lost for that ride", source[1], user["user_id"])
             continue
-        if state.set_discuss_msg(ride["session_id"], msg["message_id"]):
+        if state.set_discuss_msg(user["user_id"], ride["session_id"], msg["message_id"]):
             linked += 1
             log.info("linked ride %s: announcement %s -> discussion message %s",
                      ride["session_id"], source[1], msg["message_id"])

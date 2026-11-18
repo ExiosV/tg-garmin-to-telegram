@@ -273,8 +273,10 @@ def test_transient_send_failure_does_not_block_other_users(tmp_path):
     assert st.mail_seen("m2") and st.get_ride("abc-123")["user_id"] == 2
     f.bot_for("111:AAA").fail_status = None
     assert poll_once(cfg, gm, f, st) == 1  # user 1's announcement arrives on retry
-    assert st.get_ride("abc-123") is None or True  # user 2's row exists; user 1's too
     assert st.mail_seen("m1")
+    n1 = st.db.execute("SELECT COUNT(*) FROM rides WHERE user_id=1").fetchone()[0]
+    n2 = st.db.execute("SELECT COUNT(*) FROM rides WHERE user_id=2").fetchone()[0]
+    assert (n1, n2) == (1, 1)  # both users own their ride row
 
 
 def test_shared_garmin_session_announced_to_every_follower(tmp_path):
@@ -323,3 +325,49 @@ def test_deleted_mail_is_consumed_not_stuck(tmp_path):
     gm = _Gone(["m1"], {})
     assert poll_once(cfg, gm, f, st) == 0
     assert st.mail_seen("m1")  # consumed: no starvation of the later mails
+
+
+def test_pending_retry_keeps_the_user_scope(tmp_path):
+    """A DB write failure after the send falls back to the in-process pending set; the retry
+    must mark the seen row WITH the user id, or the per-user link dedupe would miss it."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st)
+    original = st.mark_seen
+    calls = {"n": 0}
+
+    def flaky_mark(mail_id, link=None, user_id=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database is locked")
+        original(mail_id, link, user_id)
+
+    st.mark_seen = flaky_mark
+    gm = _Gmail(["m1"], {"m1": _msg(LINK)})
+    assert poll_once(cfg, gm, f, st) == 1
+    poll_once(cfg, gm, f, st)
+    row = st.db.execute("SELECT user_id FROM seen WHERE mail_id='m1'").fetchone()
+    assert row["user_id"] == 1  # the retry kept the user scope
+
+
+def test_pass1_crash_does_not_swallow_pass2(tmp_path):
+    """The init flag is armed before the mail loop: a pass that dies (Gmail listing fails) must
+    not make the next pass silently mark the mails seen without posting them."""
+    st, cfg, f = State(str(tmp_path)), Config(), _Factory()
+    _user(st)
+
+    class _FlakyGmail(_Gmail):
+        def __init__(self, ids, msgs):
+            super().__init__(ids, msgs)
+            self.list_calls = 0
+
+        def list_ids(self, q):
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise RuntimeError("gmail listing failed")
+            return self.ids
+
+    gm = _FlakyGmail(["m1"], {"m1": _msg(LINK)})
+    with pytest.raises(RuntimeError):
+        poll_once(cfg, gm, f, st)  # pass 1 dies at listing; the flag is already armed
+    assert poll_once(cfg, gm, f, st) == 1  # pass 2 posts the mail instead of archiving it
+    assert st.mail_seen("m1")
