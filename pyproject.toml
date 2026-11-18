@@ -1,0 +1,24 @@
+[project]
+name = "tg-garmin-to-telegram"
+version = "0.1.0"
+license = {text = "Apache-2.0"}
+description = "Multi-user Telegram service: a user's Garmin LiveTrack starts are announced in their own group or channel; photo albums come next"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31",
+    "tg-botkit @ https://github.com/ExiosV/tg-botkit/archive/refs/tags/v0.3.0.tar.gz",
+    "google-kit @ https://github.com/ExiosV/google-kit/archive/refs/tags/v0.1.0.tar.gz",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
