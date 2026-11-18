@@ -35,6 +35,11 @@ class State:
                 "channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)"
             )
             self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+            # Gmail message-id dedupe for the poll loop: a mail is marked seen only after its
+            # announcement was sent (mark-after-send lives in runner.py, the table is dumb storage).
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS seen (mail_id TEXT PRIMARY KEY, link TEXT, ts INTEGER)"
+            )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS events ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts INTEGER, kind TEXT, data TEXT)"
@@ -101,6 +106,42 @@ class State:
             self.db.execute("DELETE FROM meta WHERE k=?", (k,))
             self.db.commit()
 
+    def initialized(self) -> bool:
+        """False only before the very first completed poll pass (first run marks the backlog seen)."""
+        with self._lock:
+            return self.db.execute("SELECT 1 FROM meta WHERE k='init'").fetchone() is not None
+
+    def set_initialized(self) -> None:
+        with self._lock:
+            self.db.execute("INSERT OR IGNORE INTO meta(k, v) VALUES ('init', '1')")
+            self.db.commit()
+
+    # -- seen (Gmail dedupe) --------------------------------------------------------------------------------------
+    def mail_seen(self, mail_id: str) -> bool:
+        with self._lock:
+            return self.db.execute(
+                "SELECT 1 FROM seen WHERE mail_id=?", (str(mail_id),)
+            ).fetchone() is not None
+
+    def link_seen(self, link: Optional[str]) -> bool:
+        """A canonical (token-less) LiveTrack URL announced before: a second mail for the same
+        session must not post again."""
+        if not link:
+            return False
+        with self._lock:
+            return self.db.execute(
+                "SELECT 1 FROM seen WHERE link=?", (str(link),)
+            ).fetchone() is not None
+
+    def mark_seen(self, mail_id: str, link: Optional[str] = None) -> None:
+        """Mark one mail processed; INSERT OR IGNORE keeps the first mapping."""
+        with self._lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO seen(mail_id, link, ts) VALUES (?,?,?)",
+                (str(mail_id), str(link) if link else None, int(time.time())),
+            )
+            self.db.commit()
+
     # -- users ----------------------------------------------------------------------------------------------------
     def user(self, user_id: int) -> Optional[dict]:
         with self._lock:
@@ -120,8 +161,12 @@ class State:
             return self.user(user_id)
 
     def user_by_email_token(self, token: str) -> Optional[dict]:
+        """The active user bound to this garmin-telegram+<token> recipient; setup users are invisible
+        to the poll loop (their delivery target is not final yet)."""
         with self._lock:
-            row = self.db.execute("SELECT * FROM users WHERE email_token=?", (str(token),)).fetchone()
+            row = self.db.execute(
+                "SELECT * FROM users WHERE email_token=? AND state='active'", (str(token),)
+            ).fetchone()
             return dict(row) if row else None
 
     def user_by_email(self, email_addr: str) -> Optional[dict]:
@@ -182,13 +227,17 @@ class State:
             return [dict(r) for r in rows]
 
     # -- rides ----------------------------------------------------------------------------------------------------
-    def start_ride(self, user_id: int, session_id: str, live_url: str, started_ts: int) -> bool:
-        """Remember an announced ride. A duplicate session (at-least-once send) keeps the first row."""
+    def start_ride(self, user_id: int, session_id: str, live_url: str,
+                   channel_msg_id: Optional[int] = None, started_ts: Optional[int] = None) -> bool:
+        """Remember an announced ride together with the announcement post id. A duplicate session
+        (at-least-once send) keeps the first row."""
         with self._lock:
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO rides(user_id, session_id, live_url, started_ts, state) "
-                "VALUES (?,?,?,?, 'started')",
-                (int(user_id), str(session_id), str(live_url), int(started_ts)),
+                "INSERT OR IGNORE INTO rides(user_id, session_id, live_url, channel_msg_id, started_ts, state) "
+                "VALUES (?,?,?,?,?, 'started')",
+                (int(user_id), str(session_id), str(live_url),
+                 int(channel_msg_id) if channel_msg_id is not None else None,
+                 int(started_ts) if started_ts is not None else int(time.time())),
             )
             self.db.commit()
             return cur.rowcount > 0
@@ -217,6 +266,26 @@ class State:
             )
             self.db.commit()
             return cur.rowcount > 0
+
+    def ride_by_channel_msg(self, user_id: int, channel_msg_id: int) -> Optional[dict]:
+        """This user's ride announced by `channel_msg_id`. Message ids are unique per chat only, so
+        the lookup is scoped to one user: two groups can hold the same message id."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM rides WHERE user_id=? AND channel_msg_id=?",
+                (int(user_id), int(channel_msg_id)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def unlinked_discussion_rides(self, user_id: int) -> list:
+        """This user's announced rides with no discussion thread attached yet (thread discovery input)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM rides WHERE user_id=? AND channel_msg_id IS NOT NULL "
+                "AND discuss_msg_id IS NULL ORDER BY started_ts",
+                (int(user_id),),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def set_ride_end(self, session_id: str, ended_ts: int) -> bool:
         """Close a ride with the exact end from Garmin; only a 'started' ride transitions."""

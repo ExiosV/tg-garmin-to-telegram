@@ -1,36 +1,15 @@
 import argparse
 import logging
 import sys
-import time
 
 from .config import Config
 from .gmail import Gmail
 from .redact import redact
+from .runner import poll_once, run_forever
 from .state import State
-from .telegram import Telegram
+from .telegram import MultiBot, Telegram
 
 log = logging.getLogger("tg_garmin_to_telegram")
-
-
-def poll_once(cfg, gmail, tg, state) -> int:
-    """One ingest pass. Mail parsing and delivery are not implemented yet; this stub only keeps the
-    process shape and proves the adapters wire up. Returns the number of handled mails."""
-    # TODO(next iteration): gmail.list_ids(cfg.query) -> parse the LiveTrack mail -> match the user
-    # by recipient/token -> announce the start in the user's own chat via MultiBot.
-    return 0
-
-
-def run_forever(cfg, gmail, tg, state) -> None:
-    log.info("poll loop started: every %ss, query=%r (delivery not implemented yet)",
-             cfg.poll_seconds, cfg.query)
-    while True:
-        started = time.time()
-        try:
-            poll_once(cfg, gmail, tg, state)
-        except Exception as e:  # no raw traceback: exception text can contain a bot token in a URL
-            log.error("poll pass failed: %s", redact(e))
-        delay = max(1.0, cfg.poll_seconds - (time.time() - started))
-        time.sleep(delay)
 
 
 def _build_gmail(cfg):
@@ -81,10 +60,13 @@ def main() -> None:
         if gmail is None:
             sys.exit(1)  # run/once cannot work without the mailbox; the reason is in the log
         state = State(cfg.data_dir)
+        # Deliveries go out as the user's own bot ('own') or as the service bot ('our'): the
+        # MultiBot factory owns those tokens, the Telegram service bot above is diagnostics only.
+        deliveries = MultiBot(cfg.api_base)
         if cmd == "once":
-            print("handled:", poll_once(cfg, gmail, tg, state))
+            print("handled:", poll_once(cfg, gmail, deliveries, state))
             return
-        run_forever(cfg, gmail, tg, state)
+        run_forever(cfg, gmail, deliveries, state)
     except Exception as e:  # no raw traceback: exception text can contain the bot token in a URL
         log.error("fatal: %s", redact(e))
         sys.exit(1)

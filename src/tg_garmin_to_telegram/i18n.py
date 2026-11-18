@@ -30,6 +30,7 @@ MESSAGES = {
         "lang_set": "Язык сообщений: {lang}.",
         "lang_show": "Язык сообщений: {lang} (/lang ru|en).",
         "unknown": "Не понял команду. /help — список команд.",
+        "ride_started": "🚴 {name} начал активность\n\n📍 <a href=\"{link}\">Смотреть на карту</a>",
     },
     EN: {
         "start": (
@@ -53,6 +54,7 @@ MESSAGES = {
         "lang_set": "Message language: {lang}.",
         "lang_show": "Message language: {lang} (/lang ru|en).",
         "unknown": "Unknown command. /help lists them.",
+        "ride_started": "🚴 {name} started an activity\n\n📍 <a href=\"{link}\">View on map</a>",
     },
 }
 
