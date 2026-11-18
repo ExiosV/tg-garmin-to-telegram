@@ -36,6 +36,8 @@ def test_lookup_by_email_token_and_address(tmp_path):
     st = State(str(tmp_path))
     st.touch_user(7)
     st.set_email_link(7, "tok-7", "rider@example.com")
+    assert st.user_by_email_token("tok-7") is None  # setup users are invisible to the poll loop
+    st.set_user_state(7, "active")
     assert st.user_by_email_token("tok-7")["user_id"] == 7
     assert st.user_by_email_token("nope") is None
     assert st.user_by_email("rider@example.com")["user_id"] == 7
@@ -58,20 +60,52 @@ def test_target_and_state(tmp_path):
 
 def test_start_ride_is_idempotent_per_session(tmp_path):
     st = State(str(tmp_path))
-    assert st.start_ride(1, "sess-1", "https://livetrack.garmin.com/session/s1/token/T", 100) is True
-    assert st.start_ride(1, "sess-1", "https://livetrack.garmin.com/session/s1/token/OTHER", 200) is False
+    assert st.start_ride(1, "sess-1", "https://livetrack.garmin.com/session/s1/token/T", 555, 100) is True
+    assert st.start_ride(1, "sess-1", "https://livetrack.garmin.com/session/s1/token/OTHER", 556, 200) is False
     ride = st.get_ride("sess-1")
     assert ride["live_url"].endswith("/token/T") and ride["started_ts"] == 100 and ride["state"] == "started"
+    assert ride["channel_msg_id"] == 555  # the announcement post is stored with the ride, first row wins
     assert st.get_ride("missing") is None
+
+
+def test_seen_dedupe_roundtrip(tmp_path):
+    st = State(str(tmp_path))
+    assert not st.initialized() and not st.mail_seen("m1") and not st.link_seen(None)
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/s1", user_id=7)
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/other", user_id=7)  # INSERT OR IGNORE keeps the first
+    st.mark_seen("m2")  # a mail with no link (no matching user, backlog) is still deduped by id
+    assert st.mail_seen("m1") and st.mail_seen("m2") and not st.mail_seen("m3")
+    assert st.link_seen("https://livetrack.garmin.com/session/s1", 7)
+    assert not st.link_seen("https://livetrack.garmin.com/session/s1", 8)  # per-user scope
+    assert not st.link_seen("https://livetrack.garmin.com/session/other", 7)
+    st.set_initialized()
+    assert st.initialized()
+
+
+def test_discussion_lookup_helpers(tmp_path):
+    st = State(str(tmp_path))
+    st.start_ride(1, "s1", "u", 501, 100)   # announced, no thread yet: listed
+    st.start_ride(1, "s2", "u", None, 100)  # not announced yet: excluded
+    st.start_ride(1, "s3", "u", 502, 100)   # announced and already linked: excluded
+    st.set_discuss_msg(1, "s3", 900)
+    st.start_ride(2, "s4", "u", 501, 100)   # another chat may hold the same message id
+    assert st.ride_by_channel_msg(1, 501)["session_id"] == "s1"
+    assert st.ride_by_channel_msg(1, 502)["session_id"] == "s3"
+    assert st.ride_by_channel_msg(2, 501)["session_id"] == "s4"  # scoped per user
+    assert st.ride_by_channel_msg(1, 404) is None
+    assert [r["session_id"] for r in st.unlinked_discussion_rides(1)] == ["s1"]
+    assert [r["session_id"] for r in st.unlinked_discussion_rides(2)] == ["s4"]
+    st.set_discuss_msg(1, "s1", 901)
+    assert st.unlinked_discussion_rides(1) == []
 
 
 def test_ride_lifecycle(tmp_path):
     st = State(str(tmp_path))
-    st.start_ride(1, "s1", "https://livetrack.garmin.com/session/s1", 100)
-    assert st.set_channel_msg("s1", 555) is True
-    assert st.set_channel_msg("s1", 556) is False  # already attached, never overwritten
-    assert st.set_discuss_msg("s1", 777) is True
-    st.set_activity("s1", "garmin-987")
+    st.start_ride(1, "s1", "https://livetrack.garmin.com/session/s1", started_ts=100)
+    assert st.set_channel_msg(1, "s1", 555) is True
+    assert st.set_channel_msg(1, "s1", 556) is False  # already attached, never overwritten
+    assert st.set_discuss_msg(1, "s1", 777) is True
+    st.set_activity(1, "s1", "garmin-987")
     assert st.set_ride_end("s1", 200) is True
     assert st.set_ride_end("s1", 300) is False  # only a 'started' ride transitions
     ride = st.get_ride("s1")
@@ -81,9 +115,9 @@ def test_ride_lifecycle(tmp_path):
 
 def test_user_rides_filter_and_order(tmp_path):
     st = State(str(tmp_path))
-    st.start_ride(1, "s1", "u", 100)
-    st.start_ride(1, "s2", "u", 300)
-    st.start_ride(2, "s3", "u", 200)
+    st.start_ride(1, "s1", "u", started_ts=100)
+    st.start_ride(1, "s2", "u", started_ts=300)
+    st.start_ride(2, "s3", "u", started_ts=200)
     st.set_ride_end("s1", 150)
     assert [r["session_id"] for r in st.user_rides(1)] == ["s2", "s1"]
     assert [r["session_id"] for r in st.user_rides(1, state="started")] == ["s2"]
@@ -128,10 +162,32 @@ def test_migrate_adds_missing_columns_to_legacy_db(tmp_path):
     st = State(str(tmp_path))  # bootstrap must not fail on the old shape
     u = st.user(1)
     assert u["chat_id"] == -100 and u["lang"] == "ru" and u["state"] == "setup"
-    assert st.start_ride(1, "s1", "https://livetrack.garmin.com/session/s1", 10)
+    assert st.start_ride(1, "s1", "https://livetrack.garmin.com/session/s1", started_ts=10)
     assert st.get_ride("s1")["state"] == "started"
     st.set_email_link(1, "tok", "x@example.com")  # migrated columns are usable
+    st.set_user_state(1, "active")
     assert st.user_by_email_token("tok")["user_id"] == 1
+
+
+def test_upgrade_from_base_commit_schema(tmp_path):
+    """The 5fb5b91 schema (seen without user_id, rides with a table-level UNIQUE(session_id))
+    must migrate cleanly: the column is added, the constraint is rebuilt per user."""
+    legacy = sqlite3.connect(tmp_path / "state.db")
+    legacy.execute("CREATE TABLE seen (mail_id TEXT PRIMARY KEY, link TEXT, ts INTEGER)")
+    legacy.execute(
+        "CREATE TABLE rides (ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, "
+        "session_id TEXT UNIQUE, live_url TEXT, started_ts INTEGER, ended_ts INTEGER, "
+        "state TEXT DEFAULT 'started', channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)"
+    )
+    legacy.commit()
+    legacy.close()
+    st = State(str(tmp_path))
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/s1", user_id=7)  # no OperationalError
+    assert st.link_seen("https://livetrack.garmin.com/session/s1", 7)
+    st.touch_user(7)
+    st.touch_user(8)
+    assert st.start_ride(7, "s1", "https://livetrack.garmin.com/session/s1", started_ts=10)
+    assert st.start_ride(8, "s1", "https://livetrack.garmin.com/session/s1", started_ts=10)  # rebuilt: no legacy UNIQUE
 
 
 def test_migration_is_idempotent(tmp_path):
