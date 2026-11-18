@@ -1,7 +1,7 @@
 """Garmin Connect Personal API (official, self-service): the user generates an API key in their
 Garmin Connect settings (https://connect.garmin.com/app/settings/personalApiToken, read-only, their
 own data), the key is exchanged for a bearer token, and the bearer calls the endpoints below.
-Scope here: the activity LIST only — it drives the ride-end matching for the photo albums. GPX/FIT
+Scope here: the activity list and detail — they drive the ride-end matching for the photo albums. GPX/FIT
 download is intentionally not ported (this service uploads no traces). The user's api key lives in
 users.garmin_api_key (set during onboarding).
 Docs: developer.garmin.com/gc-developer-program/personal/personal-api."""
@@ -13,7 +13,6 @@ import requests
 
 from .redact import redact
 
-log = logging.getLogger("tg_garmin_to_telegram")
 
 BASE = "https://personal.connectapi.garmin.com"
 TOKEN_PATH = "/personalapitoken-service/personal-api/personal-api-key/token"
@@ -29,10 +28,6 @@ class GarminApiError(RuntimeError):
 
 def is_auth_error(exc: Exception) -> bool:
     return isinstance(exc, GarminApiError) and exc.status in (401, 403)
-
-
-class GarminFileError(ValueError):
-    """The downloaded Garmin file is corrupt or has no usable track."""
 
 
 class GarminApiClient:

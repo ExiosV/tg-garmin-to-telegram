@@ -14,7 +14,7 @@ in the thread after the ride ends.
 cp .env.example .env   # fill in the values
 python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 .venv/bin/python -m tg_garmin_to_telegram check   # self-check: bot, optional channel, mailbox
-.venv/bin/python -m tg_garmin_to_telegram run     # poll loop (delivery comes in the next iteration)
+.venv/bin/python -m tg_garmin_to_telegram run     # poll loop
 .venv/bin/python -m tg_garmin_to_telegram once    # single pass
 ```
 

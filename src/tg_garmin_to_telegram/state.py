@@ -6,7 +6,6 @@ import time
 from typing import Optional
 
 
-
 class State:
     """SQLite persistence: users (per-user bot token, delivery target, mail token), rides, meta, events.
     Thread-safe: single connection with check_same_thread=False, guarded by an internal RLock."""
