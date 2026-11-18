@@ -20,6 +20,12 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 
 Docker: `docker build -t tg-garmin-to-telegram .` then `docker run --env-file .env tg-garmin-to-telegram run`.
 
+Reliability: an announcement is marked sent only after Telegram accepted it — after any outage the
+announcement goes out once at the next successful poll. A process restart between the send and the
+mark may repost one announcement at most once (at-least-once). A user whose delivery target is
+misconfigured (bot kicked, wrong chat) gets their announcement consumed with an event logged in
+their history; the other users are never delayed by one broken chat.
+
 ## Config
 
 All configuration is environment-based; see `.env.example` (secrets are provisioned via Bitwarden-backed

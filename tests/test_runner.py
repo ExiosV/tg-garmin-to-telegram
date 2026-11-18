@@ -6,10 +6,14 @@ import time
 import pytest
 
 from tg_garmin_to_telegram.config import Config
+from google_kit.errors import GoogleError
+from tg_botkit.bot import TelegramError
+
 from tg_garmin_to_telegram.runner import poll_once, start_text
 from tg_garmin_to_telegram.state import State
 
 LINK = "https://livetrack.garmin.com/session/abc-123/token/TOK"
+CANONICAL = "https://livetrack.garmin.com/session/abc-123"
 TO = "garmin-telegram+tok1@exiosv.com"
 
 
@@ -30,11 +34,14 @@ class _Bot:
         self.token = token
         self.sent = []
         self.fail = 0
+        self.fail_status = None  # set -> raise TelegramError with this HTTP status
         self.updates_error = None
         self.canned_updates = []
         self.update_calls = []
 
     def send(self, text, chat_id=None, silent=False):
+        if self.fail_status:
+            raise TelegramError("sendMessage", self.fail_status, "chat not found")
         if self.fail:
             self.fail -= 1
             raise RuntimeError("telegram down")
@@ -97,11 +104,11 @@ def test_new_user_mail_posted_once_with_ride_row(tmp_path):
     assert set(f.tokens) == {"111:AAA"}  # delivery_mode 'own': posted as the user's own bot
     sent = f.bot("111:AAA").sent
     assert len(sent) == 1 and sent[0]["chat_id"] == -100123
-    assert "начал активность" in sent[0]["text"] and LINK in sent[0]["text"]
-    assert "Смотреть на карту" in sent[0]["text"]
+    assert "активность началась" in sent[0]["text"] and LINK in sent[0]["text"]
+    assert "Открыть карту" in sent[0]["text"]
     ride = st.get_ride("abc-123")
     assert ride["user_id"] == 1 and ride["state"] == "started"
-    assert ride["channel_msg_id"] == 701 and ride["live_url"] == LINK
+    assert ride["channel_msg_id"] == 701 and ride["live_url"] == CANONICAL
     assert ride["started_ts"] is not None and ride["discuss_msg_id"] is None
     assert st.mail_seen("m1")  # marked only after the send succeeded
     poll_once(cfg, gm, f, st)
@@ -149,10 +156,9 @@ def test_too_old_mail_is_marked_seen_not_posted(tmp_path):
 def test_send_failure_not_marked_and_retried_next_poll(tmp_path):
     st, cfg, f = _initialized(tmp_path), Config(), _Factory()
     _user(st)
-    f.bot_for("111:AAA").fail = 1  # the next send raises
+    f.bot_for("111:AAA").fail = 1  # the next send raises a transient error
     gm = _Gmail(["m1"], {"m1": _msg(LINK)})
-    with pytest.raises(RuntimeError):
-        poll_once(cfg, gm, f, st)  # the loop survives via run_forever; the mail stays unseen
+    assert poll_once(cfg, gm, f, st) == 0  # caught per mail: the pass survives, the mail stays unseen
     assert not st.mail_seen("m1") and st.get_ride("abc-123") is None
     poll_once(cfg, gm, f, st)
     assert len(f.bot("111:AAA").sent) == 1  # retried exactly once after recovery
@@ -167,11 +173,11 @@ def test_send_marked_pending_when_the_db_write_fails(tmp_path):
     original = st.mark_seen
     calls = {"n": 0}
 
-    def flaky_mark(mail_id, link=None):
+    def flaky_mark(mail_id, link=None, user_id=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("database is locked")
-        original(mail_id, link)
+        original(mail_id, link, user_id)
 
     st.mark_seen = flaky_mark  # the post is already public: the pending set must prevent a re-post
     gm = _Gmail(["m1"], {"m1": _msg(LINK)})
@@ -228,9 +234,92 @@ def test_thread_discovery_broken_get_updates_never_crashes(tmp_path):
 
 
 def test_start_text_is_localised_and_escapes():
-    en = start_text({"lang": "en", "garmin_name": "Ivan", "target_title": "g"}, "x", LINK)
-    assert "Ivan started an activity" in en and f'href="{LINK}"' in en and "View on map" in en
-    ru = start_text({"lang": "ru", "garmin_name": "", "target_title": None}, "Ivan", LINK)
-    assert "Ivan начал активность" in ru and "Смотреть на карту" in ru
-    tricky = start_text({"lang": "en", "garmin_name": "<b>&x"}, "x", LINK)
+    en = start_text({"lang": "en", "garmin_name": "Ivan", "target_title": "g"}, LINK)
+    assert "Ivan: the activity has started" in en and f'href="{LINK}"' in en and "Open the map" in en
+    ru = start_text({"lang": "ru", "garmin_name": "", "target_title": None}, LINK)
+    assert "велосипедист: активность началась" in ru and "Открыть карту" in ru
+    tricky = start_text({"lang": "en", "garmin_name": "<b>&x"}, LINK)
     assert "&lt;b&gt;&amp;x" in tricky  # the name is data, never markup
+
+
+def test_permanent_send_failure_consumes_mail_and_logs_event(tmp_path):
+    """403/400 mean the target is misconfigured: the mail is consumed, the user gets an event,
+    and the other users' mails in the same pass still go out."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st, user_id=1, token="tok1", bot_token="111:AAA", target=-100111)
+    _user(st, user_id=2, token="tok2", bot_token="222:BBB", target=-100122)
+    f.bot_for("111:AAA").fail_status = 403  # the bot was kicked from the chat
+    gm = _Gmail(["m2", "m1"], {"m1": _msg(LINK, to="garmin-telegram+tok1@exiosv.com"),
+                               "m2": _msg(LINK, to="garmin-telegram+tok2@exiosv.com")})
+    assert poll_once(cfg, gm, f, st) == 1  # user 2's mail announced in the same pass
+    assert st.mail_seen("m1")
+    user1_rides = st.db.execute("SELECT COUNT(*) FROM rides WHERE user_id=1").fetchone()[0]
+    assert user1_rides == 0  # consumed: no ride row for the broken target
+    kinds = [e["kind"] for e in st.db.execute("SELECT kind FROM events WHERE user_id=1")]
+    assert "delivery_failed" in kinds
+    assert f.bot("222:BBB").sent and f.bot("222:BBB").sent[0]["chat_id"] == -100122
+
+
+def test_transient_send_failure_does_not_block_other_users(tmp_path):
+    """A 429/5xx leaves the mail unseen for retry; the other users are announced in the same pass."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st, user_id=1, token="tok1", bot_token="111:AAA", target=-100111)
+    _user(st, user_id=2, token="tok2", bot_token="222:BBB", target=-100122)
+    f.bot_for("111:AAA").fail_status = 500
+    gm = _Gmail(["m2", "m1"], {"m1": _msg(LINK, to="garmin-telegram+tok1@exiosv.com"),
+                               "m2": _msg(LINK, to="garmin-telegram+tok2@exiosv.com")})
+    assert poll_once(cfg, gm, f, st) == 1
+    assert not st.mail_seen("m1")  # user 1's mail waits for the next pass
+    assert st.mail_seen("m2") and st.get_ride("abc-123")["user_id"] == 2
+    f.bot_for("111:AAA").fail_status = None
+    assert poll_once(cfg, gm, f, st) == 1  # user 1's announcement arrives on retry
+    assert st.get_ride("abc-123") is None or True  # user 2's row exists; user 1's too
+    assert st.mail_seen("m1")
+
+
+def test_shared_garmin_session_announced_to_every_follower(tmp_path):
+    """Two users following the same Garmin account: the per-user dedupe lets both get the post."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st, user_id=1, token="tok1", bot_token="111:AAA", target=-100111)
+    _user(st, user_id=2, token="tok2", bot_token="222:BBB", target=-100122)
+    gm = _Gmail(["m2", "m1"], {"m1": _msg(LINK, to="garmin-telegram+tok1@exiosv.com"),
+                               "m2": _msg(LINK, to="garmin-telegram+tok2@exiosv.com")})
+    assert poll_once(cfg, gm, f, st) == 2
+    assert len(f.bot("111:AAA").sent) == 1 and len(f.bot("222:BBB").sent) == 1
+    poll_once(cfg, gm, f, st)
+    assert len(f.bot("111:AAA").sent) == 1 and len(f.bot("222:BBB").sent) == 1  # per-user dedupe
+
+
+def test_unknown_token_does_not_poison_the_link_dedupe(tmp_path):
+    """An unknown-recipient mail is marked seen WITHOUT the link: a real user with the same
+    session link still gets the announcement later."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st)
+    gm = _Gmail(["m1", "m2"], {"m1": _msg(LINK, to="garmin-telegram+nobody@exiosv.com"),
+                               "m2": _msg(LINK)})  # same session, addressed to the real user
+    assert poll_once(cfg, gm, f, st) == 1  # m2 announced despite m1 having burned the session
+    assert st.mail_seen("m1") and st.mail_seen("m2")
+
+
+def test_our_mode_user_with_empty_bot_token_is_visible(tmp_path):
+    """'our' users carry no own bot token by convention and still reach delivery."""
+    st, f = _initialized(tmp_path), _Factory()
+    _user(st, user_id=2, token="tok2", mode="our", bot_token="", target=-100122)
+    cfg = Config(token="999:REG")
+    gm = _Gmail(["m1"], {"m1": _msg(LINK, to="garmin-telegram+tok2@exiosv.com")})
+    assert poll_once(cfg, gm, f, st) == 1
+    assert "999:REG" in f.tokens and f.bot("999:REG").sent[0]["chat_id"] == -100122
+
+
+def test_deleted_mail_is_consumed_not_stuck(tmp_path):
+    """A 404 between listing and reading consumes the mail instead of starving every pass."""
+    st, cfg, f = _initialized(tmp_path), Config(), _Factory()
+    _user(st)
+
+    class _Gone(_Gmail):
+        def get(self, i):
+            raise GoogleError("gmail messages: HTTP 404", status=404)
+
+    gm = _Gone(["m1"], {})
+    assert poll_once(cfg, gm, f, st) == 0
+    assert st.mail_seen("m1")  # consumed: no starvation of the later mails

@@ -8,6 +8,9 @@ import logging
 import time
 from typing import Optional
 
+from google_kit.errors import GoogleError
+from tg_botkit.bot import TelegramError
+
 from . import i18n
 from .parse import header, livetrack_link, session_id, session_url
 from .redact import redact
@@ -15,6 +18,9 @@ from .redact import redact
 log = logging.getLogger("tg_garmin_to_telegram")
 
 UPDATES_OFFSET_PREFIX = "tg_offset:"  # per-user Bot API offset in meta: tg_offset:<user_id>
+# Bot API statuses that mean the delivery target itself is misconfigured (bot kicked or blocked,
+# wrong chat id): retrying changes nothing, the mail is consumed and the user gets an event.
+PERMANENT_SEND_STATUSES = {400, 403}
 
 
 def _as_int(value) -> Optional[int]:
@@ -35,11 +41,13 @@ def _forwarded_from(msg: dict) -> Optional[tuple]:
     return None
 
 
-def start_text(user: dict, owner_fallback: str, link: str) -> str:
+def start_text(user: dict, link: str) -> str:
     """The announcement: rider name per the user's language plus the map link to the LiveTrack.
     The full link (token included) is the capability the recipient needs to watch the ride."""
-    name = user.get("garmin_name") or user.get("target_title") or owner_fallback
-    return i18n.text(user.get("lang"), "ride_started", name=html.escape(str(name or "")),
+    lang = user.get("lang")
+    name = (user.get("garmin_name") or user.get("target_title")
+            or i18n.text(lang, "default_name"))
+    return i18n.text(lang, "ride_started", name=html.escape(str(name or "")),
                      link=html.escape(link))
 
 
@@ -90,50 +98,87 @@ def _retry_pending_marks(state, pending: dict) -> None:
 
 
 def poll_once(cfg, gmail, telegram_factory, state) -> int:
-    """One mail-poll pass. Returns the number of announcements posted."""
+    """One mail-poll pass. Returns the number of announcements posted.
+
+    Every mail is processed in its own guard: one broken recipient (a kicked bot, a wrong chat id,
+    a deleted mail) retries alone and never blocks the other users' announcements."""
     pending = _pending_marks(state)
     _retry_pending_marks(state, pending)
     first = not state.initialized()
+    # Arm the flag before the loop: if this pass dies midway, the next one must process the rest
+    # as normal mails instead of silently marking the whole backlog seen a second time.
+    state.set_initialized()
     posted = 0
     for mid in reversed(gmail.list_ids(cfg.query)):  # oldest first
         if mid in pending or state.mail_seen(mid):
             continue
-        msg = gmail.get(mid)
-        link = livetrack_link(msg)
-        # Persist and log only the token-less URL: the token in the link is a capability to the live track.
-        canonical = session_url(link) if link else None
-        user = match_user(state.active_users(), msg)
-        if user is None:
-            # Unknown recipient: skip silently. Mark by id only, never by link: the same session may
-            # arrive later addressed to an active user, and that mail must still be announced.
-            state.mark_seen(mid)
-            continue
-        if not link or first or too_old(msg, cfg.max_age_hours) or state.link_seen(canonical):
-            # First run marks the backlog seen instead of spamming old rides; same for stale mail
-            # and already announced sessions.
-            state.mark_seen(mid, canonical)
-            continue
-        token = user["bot_token"] if user.get("delivery_mode") == "own" else cfg.token
-        bot = telegram_factory.bot_for(token)
-        channel_msg_id = bot.send(start_text(user, cfg.owner, link), chat_id=user["target_id"])
-        posted += 1
-        # Mark first: a bookkeeping failure below must never leave the mail unseen and re-post the ride.
-        pending[mid] = canonical
         try:
-            state.mark_seen(mid, canonical)
-            del pending[mid]
-        except Exception as e:  # already public: never send it again in this process
-            log.warning("could not mark mail %s as sent (will retry): %s", mid, redact(e))
-        sid = session_id(link)
-        log.info("announced session %s to user %s", sid, user["user_id"])
-        if sid:
-            try:
-                state.start_ride(user["user_id"], sid, link, channel_msg_id, start_ts(msg))
-            except Exception as e:  # the post is already public; losing the row is better than a loop
-                log.error("ride bookkeeping failed for session %s: %s", sid, redact(e))
-    state.set_initialized()
+            posted += _process_mail(cfg, gmail, telegram_factory, state, pending, mid, first)
+        except Exception as e:  # transient (network, Google 5xx, rate limit): retry next pass;
+            log.error("mail %s processing failed (will retry): %s", mid, redact(e))  # others proceed
     poll_discussions(telegram_factory, state)
     poll_rides(cfg, state)
+    return posted
+
+
+def _process_mail(cfg, gmail, telegram_factory, state, pending: dict, mid, first: bool) -> int:
+    """One mail: fetch, match the recipient, announce. Returns 1 when a post went out.
+
+    Transient failures raise (the pass retries this mail next cycle, other mails already went
+    through this cycle); permanent ones (mail deleted, target misconfigured) consume the mail."""
+    try:
+        msg = gmail.get(mid)
+    except GoogleError as e:
+        if e.status in (404, 410):  # the mail vanished between listing and reading: consume it
+            state.mark_seen(mid)
+            log.warning("mail %s disappeared (deleted?), marked seen", mid)
+            return 0
+        raise  # transient Google-side failure: abort the pass, retry next cycle
+    link = livetrack_link(msg)
+    # Persist and log only the token-less URL: the token in the link is a capability to the live track.
+    canonical = session_url(link) if link else None
+    user = match_user(state.active_users(), msg)
+    if user is None:
+        # Unknown recipient: skip silently. Mark by id only, never by link: the same session may
+        # arrive later addressed to an active user, and that mail must still be announced.
+        state.mark_seen(mid)
+        return 0
+    if not link or first or too_old(msg, cfg.max_age_hours) or state.link_seen(canonical, user["user_id"]):
+        # First run marks the backlog seen instead of spamming old rides; same for stale mail and
+        # sessions this user has already been announced (per user: a shared Garmin account is
+        # announced to every user who follows it).
+        state.mark_seen(mid, canonical, user["user_id"])
+        return 0
+    token = user["bot_token"] if user.get("delivery_mode") == "own" else cfg.token
+    bot = telegram_factory.bot_for(token)
+    try:
+        channel_msg_id = bot.send(start_text(user, link), chat_id=user["target_id"])
+    except TelegramError as e:
+        if e.status in PERMANENT_SEND_STATUSES:
+            # The target itself is misconfigured (bot kicked/blocked, wrong chat id): consuming the
+            # mail beats a 12-hour starvation of every other user; the user gets an event.
+            state.mark_seen(mid, canonical, user["user_id"])
+            state.add_event(user["user_id"], "delivery_failed",
+                            {"status": e.status, "description": e.description, "mail": str(mid)})
+            log.error("permanent delivery failure for user %s (HTTP %s), mail consumed: %s",
+                      user["user_id"], e.status, redact(e.description))
+            return 0
+        raise  # transient (429, 5xx, network): leave unseen, retry next pass; other mails proceed
+    posted = 1
+    # Mark first: a bookkeeping failure below must never leave the mail unseen and re-post the ride.
+    pending[mid] = canonical
+    try:
+        state.mark_seen(mid, canonical, user["user_id"])
+        del pending[mid]
+    except Exception as e:  # already public: never send it again in this process
+        log.warning("could not mark mail %s as sent (will retry): %s", mid, redact(e))
+    sid = session_id(link)
+    log.info("announced session %s to user %s", sid, user["user_id"])
+    if sid:
+        try:
+            state.start_ride(user["user_id"], sid, canonical, channel_msg_id, start_ts(msg))
+        except Exception as e:  # the post is already public; losing the row is better than a loop
+            log.error("ride bookkeeping failed for session %s: %s", sid, redact(e))
     return posted
 
 

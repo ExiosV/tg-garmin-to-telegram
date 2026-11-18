@@ -19,10 +19,11 @@ def _bodies(part: dict):
 
 
 def header(msg: dict, name: str) -> str:
-    for h in msg.get("payload", {}).get("headers", []):
-        if h["name"].lower() == name.lower():
-            return h["value"]
-    return ""
+    """All values of one header joined (a mail can carry several Delivered-To lines)."""
+    values = [h["value"] for h in msg.get("payload", {}).get("headers", [])
+              if h.get("name", "").lower() == name.lower()]
+    return ", ".join(v for v in values if v)
+
 
 
 def livetrack_link(msg: dict) -> Optional[str]:

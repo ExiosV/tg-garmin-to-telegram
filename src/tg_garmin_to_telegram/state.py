@@ -30,7 +30,7 @@ class State:
             )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rides ("
-                "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT UNIQUE, "
+                "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT, "
                 "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, state TEXT DEFAULT 'started', "
                 "channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)"
             )
@@ -38,7 +38,7 @@ class State:
             # Gmail message-id dedupe for the poll loop: a mail is marked seen only after its
             # announcement was sent (mark-after-send lives in runner.py, the table is dumb storage).
             self.db.execute(
-                "CREATE TABLE IF NOT EXISTS seen (mail_id TEXT PRIMARY KEY, link TEXT, ts INTEGER)"
+                "CREATE TABLE IF NOT EXISTS seen (mail_id TEXT PRIMARY KEY, link TEXT, user_id INTEGER, ts INTEGER)"
             )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS events ("
@@ -74,6 +74,12 @@ class State:
             self.db.execute(
                 "CREATE UNIQUE INDEX uix_users_email_token ON users(email_token) "
                 "WHERE email_token IS NOT NULL"
+            )
+        idx_rides = {r[1] for r in self.db.execute("PRAGMA index_list(rides)")}
+        if "uix_rides_user_session" not in idx_rides:
+            # per-user session dedupe: two users may share one Garmin account — each gets the post
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uix_rides_user_session ON rides(user_id, session_id)"
             )
         rides_cols = {r[1] for r in self.db.execute("PRAGMA table_info(rides)")}
         for name, ddl in (
@@ -123,22 +129,27 @@ class State:
                 "SELECT 1 FROM seen WHERE mail_id=?", (str(mail_id),)
             ).fetchone() is not None
 
-    def link_seen(self, link: Optional[str]) -> bool:
-        """A canonical (token-less) LiveTrack URL announced before: a second mail for the same
-        session must not post again."""
+    def link_seen(self, link: Optional[str], user_id: Optional[int] = None) -> bool:
+        """A canonical (token-less) LiveTrack URL announced before FOR THIS USER: a second mail for
+        the same session must not post again. Scoped per user on purpose: two users sharing one
+        Garmin account each get their own announcement."""
         if not link:
             return False
         with self._lock:
             return self.db.execute(
-                "SELECT 1 FROM seen WHERE link=?", (str(link),)
+                "SELECT 1 FROM seen WHERE link=? AND user_id=?",
+                (str(link), int(user_id) if user_id is not None else -1),
             ).fetchone() is not None
 
-    def mark_seen(self, mail_id: str, link: Optional[str] = None) -> None:
-        """Mark one mail processed; INSERT OR IGNORE keeps the first mapping."""
+    def mark_seen(self, mail_id: str, link: Optional[str] = None,
+                  user_id: Optional[int] = None) -> None:
+        """Mark one mail processed; INSERT OR IGNORE keeps the first mapping. user_id scopes the
+        link dedupe; unknown-recipient mails carry neither link nor user."""
         with self._lock:
             self.db.execute(
-                "INSERT OR IGNORE INTO seen(mail_id, link, ts) VALUES (?,?,?)",
-                (str(mail_id), str(link) if link else None, int(time.time())),
+                "INSERT OR IGNORE INTO seen(mail_id, link, user_id, ts) VALUES (?,?,?,?)",
+                (str(mail_id), str(link) if link else None,
+                 int(user_id) if user_id is not None else None, int(time.time())),
             )
             self.db.commit()
 
@@ -218,11 +229,13 @@ class State:
             self.db.commit()
 
     def active_users(self) -> list:
-        """Users whose delivery is fully configured: own bot token plus a concrete target chat."""
+        """Users whose delivery is fully configured: a concrete target chat plus either their own
+        bot token ('own') or the service bot ('our' — bot_token stays empty by convention)."""
         with self._lock:
             rows = self.db.execute(
-                "SELECT * FROM users WHERE state='active' AND bot_token IS NOT NULL AND bot_token != '' "
-                "AND target_id IS NOT NULL ORDER BY user_id"
+                "SELECT * FROM users WHERE state='active' AND target_id IS NOT NULL AND "
+                "((delivery_mode='our') OR (delivery_mode='own' AND bot_token IS NOT NULL AND bot_token != '')) "
+                "ORDER BY user_id"
             ).fetchall()
             return [dict(r) for r in rows]
 

@@ -71,12 +71,13 @@ def test_start_ride_is_idempotent_per_session(tmp_path):
 def test_seen_dedupe_roundtrip(tmp_path):
     st = State(str(tmp_path))
     assert not st.initialized() and not st.mail_seen("m1") and not st.link_seen(None)
-    st.mark_seen("m1", "https://livetrack.garmin.com/session/s1")
-    st.mark_seen("m1", "https://livetrack.garmin.com/session/other")  # INSERT OR IGNORE keeps the first
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/s1", user_id=7)
+    st.mark_seen("m1", "https://livetrack.garmin.com/session/other", user_id=7)  # INSERT OR IGNORE keeps the first
     st.mark_seen("m2")  # a mail with no link (no matching user, backlog) is still deduped by id
     assert st.mail_seen("m1") and st.mail_seen("m2") and not st.mail_seen("m3")
-    assert st.link_seen("https://livetrack.garmin.com/session/s1")
-    assert not st.link_seen("https://livetrack.garmin.com/session/other")
+    assert st.link_seen("https://livetrack.garmin.com/session/s1", 7)
+    assert not st.link_seen("https://livetrack.garmin.com/session/s1", 8)  # per-user scope
+    assert not st.link_seen("https://livetrack.garmin.com/session/other", 7)
     st.set_initialized()
     assert st.initialized()
 

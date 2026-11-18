@@ -30,7 +30,8 @@ MESSAGES = {
         "lang_set": "Язык сообщений: {lang}.",
         "lang_show": "Язык сообщений: {lang} (/lang ru|en).",
         "unknown": "Не понял команду. /help — список команд.",
-        "ride_started": "🚴 {name} начал активность\n\n📍 <a href=\"{link}\">Смотреть на карту</a>",
+        "ride_started": "🚴 {name}: активность началась\n\n📍 <a href=\"{link}\">Открыть карту</a>",
+        "default_name": "велосипедист",
     },
     EN: {
         "start": (
@@ -54,7 +55,8 @@ MESSAGES = {
         "lang_set": "Message language: {lang}.",
         "lang_show": "Message language: {lang} (/lang ru|en).",
         "unknown": "Unknown command. /help lists them.",
-        "ride_started": "🚴 {name} started an activity\n\n📍 <a href=\"{link}\">View on map</a>",
+        "ride_started": "🚴 {name}: the activity has started\n\n📍 <a href=\"{link}\">Open the map</a>",
+        "default_name": "the rider",
     },
 }
 
