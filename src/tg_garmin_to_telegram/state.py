@@ -1,12 +1,10 @@
 import json
-import logging
 import os
 import sqlite3
 import threading
 import time
 from typing import Optional
 
-log = logging.getLogger("tg_garmin_to_telegram")
 
 
 class State:
@@ -29,7 +27,7 @@ class State:
                 "user_id INTEGER PRIMARY KEY, chat_id INTEGER, lang TEXT DEFAULT 'ru', created_ts INTEGER, "
                 "email_token TEXT, email_addr TEXT, delivery_mode TEXT DEFAULT 'own', "
                 "bot_token TEXT, target_type TEXT, target_id INTEGER, target_title TEXT, "
-                "state TEXT DEFAULT 'setup', photos_alpha INTEGER DEFAULT 1)"
+                "state TEXT DEFAULT 'setup', photos_alpha INTEGER DEFAULT 1, garmin_api_key TEXT, garmin_name TEXT)"
             )
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rides ("
@@ -62,6 +60,8 @@ class State:
             ("target_title", "TEXT"),
             ("state", "TEXT DEFAULT 'setup'"),
             ("photos_alpha", "INTEGER DEFAULT 1"),
+            ("garmin_api_key", "TEXT"),
+            ("garmin_name", "TEXT"),
         ):
             if name not in users_cols:
                 self.db.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")

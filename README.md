@@ -2,10 +2,11 @@
 
 Multi-user Telegram service: when a user's Garmin activity starts (a LiveTrack email lands in the
 watched Gmail mailbox), the service announces the start in that user's own Telegram group or
-channel — sent as the user's own bot. Photo albums of the ride come next.
+channel — sent as the user's own bot.
 
-**Alpha**: в альфа-версии доступно автоматическое добавление фото поездки в группу или в обсуждение
-постов канала.
+**Alpha**: automatic adding of ride photos to the group or to the discussion thread of channel
+posts is available — the user sends the photos to the bot during the ride, and the album appears
+in the thread after the ride ends.
 
 ## Run
 
