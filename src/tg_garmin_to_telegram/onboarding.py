@@ -40,15 +40,6 @@ STAGE_OWN_CHAT = "onb_own_chat"
 STAGE_OWN_CHAT_CONFIRM = "onb_own_chat_confirm"
 STAGE_GARMIN_KEY = "onb_garmin_key"
 
-CHAT_MEMBER_HANDLER = None  # set by cli wiring: the delivery loop routes my_chat_member updates here
-
-
-def set_chat_member_handler(fn) -> None:
-    """Register the onboarding handler for my_chat_member updates arriving on user bots."""
-    global CHAT_MEMBER_HANDLER
-    CHAT_MEMBER_HANDLER = fn
-
-
 def _pending(state, uid: int) -> Optional[dict]:
     raw = state.get_meta(f"pending:{uid}")
     if not raw:
@@ -154,17 +145,22 @@ def handle_message(cfg, state, bots, msg: dict) -> None:
               kbd=_menu(user, cfg))
         return
     if text.startswith("/lang"):
-        code = text.split()[-1].lower() if len(text.split()) > 1 else ""
-        lang = i18n.normalize(code)
-        state.set_lang(uid, lang)
-        _send(bot, uid, i18n.text(lang, "lang_set", lang="RU" if lang == i18n.RU else "EN"))
+        parts = text.split()
+        if len(parts) > 1 and parts[1].lower() in (i18n.RU, i18n.EN):
+            lang = parts[1].lower()
+            state.set_lang(uid, lang)
+            _send(bot, uid, i18n.text(lang, "lang_set", lang="RU" if lang == i18n.RU else "EN"))
+        else:
+            _send(bot, uid, i18n.text(lang, "lang_show", lang="RU" if lang == i18n.RU else "EN"))
         return
     if text.startswith("/status"):
         _send(bot, uid, _status_text(state, user))
         return
     if text.startswith("/cancel"):
-        _pending_pop(state, uid)
-        _send(bot, uid, i18n.text(lang, "lang_show", lang="RU" if lang == i18n.RU else "EN"))
+        if _pending_pop(state, uid):
+            _send(bot, uid, i18n.text(lang, "dialog_cancelled"))
+        else:
+            _send(bot, uid, i18n.text(lang, "unknown"))
         return
     if text.startswith("/help"):
         _send(bot, uid, i18n.text(lang, "help", code=msg.get("from", {}).get("language_code")))
@@ -173,7 +169,10 @@ def handle_message(cfg, state, bots, msg: dict) -> None:
     pending = _pending(state, uid)
     if pending and pending.get("stage") == STAGE_OWN_TOKEN:
         _pending_pop(state, uid)
-        bot.delete(msg.get("message_id"), chat_id=uid)  # the token leaves the chat at once
+        try:
+            bot.delete(msg.get("message_id"), chat_id=uid)  # the token leaves the chat at once
+        except Exception as e:
+            log.warning("could not delete the token message: %s", redact(e))
         try:
             bot_info = bots.bot_for(text).whoami()
         except Exception as e:
@@ -185,7 +184,10 @@ def handle_message(cfg, state, bots, msg: dict) -> None:
         return
     if pending and pending.get("stage") == STAGE_GARMIN_KEY:
         _pending_pop(state, uid)
-        bot.delete(msg.get("message_id"), chat_id=uid)  # the key leaves the chat at once
+        try:
+            bot.delete(msg.get("message_id"), chat_id=uid)  # the key leaves the chat at once
+        except Exception as e:
+            log.warning("could not delete the key message: %s", redact(e))
         try:
             acts = GarminApiClient(text).recent_activities(1)
         except GarminApiError as e:
@@ -256,12 +258,12 @@ def handle_own_chat_member(cfg, state, bots, update: dict) -> None:
         return  # the own-bot token is not linked yet: nothing to confirm
     bot = bots.bot_for(cfg.token)
     lang = user.get("lang")
-    kind = i18n.text(lang, "menu_own_bot") if chat.get("type") == "channel" else \
-        i18n.text(lang, "menu_service_bot")
+    kind = i18n.text(lang, "kind_channel") if chat.get("type") == "channel" else \
+        i18n.text(lang, "kind_group")
     _pending_set(state, uid, STAGE_OWN_CHAT_CONFIRM, mode="own", chat=chat)
     title = html.escape(str(chat.get("title") or ""))
     _send(bots.bot_for(cfg.token), uid,
-          i18n.text(lang, "chat_confirm", title=title, kind=kind.split()[0]),
+          i18n.text(lang, "chat_confirm", title=title, kind=kind),
           kbd=[[(i18n.text(lang, "chat_confirm_yes"), "onb:chat_yes")]])
 
 
@@ -280,12 +282,12 @@ def handle_service_chat_member(cfg, state, bots, update: dict) -> None:
         return
     bot = bots.bot_for(cfg.token)
     lang = user.get("lang")
-    kind = i18n.text(lang, "menu_own_bot") if chat.get("type") == "channel" else \
-        i18n.text(lang, "menu_service_bot")
+    kind = i18n.text(lang, "kind_channel") if chat.get("type") == "channel" else \
+        i18n.text(lang, "kind_group")
     _pending_set(state, uid, STAGE_OWN_CHAT_CONFIRM, mode="our", chat=chat)
     title = html.escape(str(chat.get("title") or ""))
     _send(bot, uid,
-          i18n.text(lang, "chat_confirm", title=title, kind=kind.split()[0]),
+          i18n.text(lang, "chat_confirm", title=title, kind=kind),
           kbd=[[(i18n.text(lang, "chat_confirm_yes"), "onb:chat_yes")]])
 
 

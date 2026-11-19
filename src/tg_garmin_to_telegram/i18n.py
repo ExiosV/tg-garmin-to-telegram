@@ -85,16 +85,18 @@ MESSAGES = {
         "not_set": "не задан",
         "no_garmin": "не привязан",
         "test_announce": "🧪 Тестовый анонс Garmin → Telegram: доставка работает!",
+        "kind_group": "группа",
+        "kind_channel": "канал",
+        "dialog_cancelled": "Диалог отменён. /start — заново.",
     },
     EN: {
         "start": (
             "🚴 <b>Garmin → Telegram</b>\n"
-            "The bot announces the start of your Garmin LiveTrack activities: the Garmin email lands in "
-            "the watched mailbox, and a notice appears in your own Telegram group or channel — sent as "
-            "your own bot.\n\n"
-            "📸 In the alpha version, automatic adding of ride photos to the group or to the discussion "
-            "thread of channel posts is available: send the photos to the bot during the ride — the "
-            "album appears in the thread after it ends.\n\n"
+            "The bot announces the start of your Garmin LiveTrack activities: Garmin emails are read "
+            "from a watched mailbox, and a notice appears in your own Telegram group or channel — "
+            "sent as your own bot.\n\n"
+            "📸 Alpha: ride photo albums are available — send the photos to the bot during the ride, "
+            "and the album lands in the thread after the ride ends.\n\n"
             "<b>Settings</b>\n"
             "/lang ru|en — message language\n"
             "/help — help"
@@ -163,6 +165,9 @@ MESSAGES = {
         "not_set": "not set",
         "no_garmin": "not linked",
         "test_announce": "🧪 Garmin → Telegram test announcement: delivery works!",
+        "kind_group": "group",
+        "kind_channel": "channel",
+        "dialog_cancelled": "Dialog cancelled. /start to begin again.",
     },
 }
 

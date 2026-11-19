@@ -206,3 +206,48 @@ def test_get_updates_failure_never_raises(tmp_path):
     f.bot_for("999:REG").updates_error = RuntimeError("telegram down")
     onboarding.poll_once(cfg, st, f)  # must not raise
     assert st.get_meta("onb_offset", "0") == "0"
+
+
+def test_setup_own_user_chat_member_reaches_confirm(tmp_path):
+    """The dead-end fix: a setup user who linked their bot gets their bot's my_chat_member watched
+    (poll_discussions covers setup 'own' users), the confirm goes out, and the chat_yes finalizes."""
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg()
+    onboarding.handle_message(cfg, st, f, _msg(text="/start"))
+    onboarding.handle_callback(cfg, st, f, {"from": {"id": 5}, "data": "onb:own_bot"})
+    onboarding.handle_message(cfg, st, f, _msg(uid=5, text="111:USERBOT"))
+    # the user is still 'setup' with a target_id NULL: the old code never polled them
+    assert st.user(5)["state"] == "setup" and st.user(5)["target_id"] is None
+    f.bot_for("111:USERBOT").canned_updates = [{
+        "update_id": 5,
+        "my_chat_member": {"chat": {"id": -100777, "title": "Ride chat", "type": "supergroup"},
+                           "from": {"id": 5},
+                           "new_chat_member": {"status": "administrator"}},
+    }]
+    from tg_garmin_to_telegram import runner as runner_mod
+    onboarding.handle_own_chat_member  # exists
+    runner_mod.set_chat_member_handler(lambda state, update:
+                                       onboarding.handle_own_chat_member(cfg, state, f, update))
+    runner_mod.poll_discussions(f, st)
+    confirm = f.bot_for("999:REG").sent[-1]["text"]
+    assert "Ride chat" in confirm and "группа" in confirm  # a real kind word, not an emoji
+    onboarding.handle_callback(cfg, st, f, {"from": {"id": 5}, "data": "onb:chat_yes"})
+    u = st.user(5)
+    assert u["state"] == "active" and u["target_id"] == -100777
+
+
+def test_cancel_and_bare_lang_wording(tmp_path):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg()
+    onboarding.handle_message(cfg, st, f, _msg(text="/start"))
+    onboarding.handle_callback(cfg, st, f, {"from": {"id": 5}, "data": "onb:own_bot"})
+    onboarding.handle_message(cfg, st, f, _msg(uid=5, text="/cancel"))
+    assert "отменён" in f.bot_for("999:REG").sent[-1]["text"]
+    onboarding.handle_message(cfg, st, f, _msg(uid=5, text="/lang"))
+    assert "Язык сообщений: RU" in f.bot_for("999:REG").sent[-1]["text"]  # shown, not switched
+
+
+def test_redact_covers_bare_token(tmp_path):
+    from tg_garmin_to_telegram.redact import redact
+    out = redact("sendMessage: chat not found for 1234567:AAE_ab-XYZ_very_long_token_part")
+    assert "1234567" not in out and "AAE_ab" not in out

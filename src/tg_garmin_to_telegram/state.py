@@ -263,6 +263,17 @@ class State:
             )
             self.db.commit()
 
+    def setup_own_users(self) -> list:
+        """Users in the middle of the own-bot onboarding: they linked a bot token and wait for the
+        my_chat_member update that tells us which chat the bot was added to. The chat-confirm poll
+        loop reads exactly these bots (their getUpdates is otherwise unconsumed)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM users WHERE state='setup' AND delivery_mode='own' "
+                "AND bot_token IS NOT NULL AND bot_token != '' ORDER BY user_id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def active_users(self) -> list:
         """Users whose delivery is fully configured: a concrete target chat plus either their own
         bot token ('own') or the service bot ('our' — bot_token stays empty by convention)."""
