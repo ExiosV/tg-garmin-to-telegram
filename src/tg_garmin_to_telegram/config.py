@@ -40,9 +40,11 @@ class Config:
     data_dir: str = "./data"
     poll_seconds: int = 30
     max_age_hours: float = 12  # mails older than this are not announced after an outage
-    ingest_port: int = 8080    # ingest HTTP API port (onboarding webhooks come later)
+    ingest_port: int = 8080    # ingest HTTP API port (the website and the dashboard read through it)
     ingest_token: str = ""     # cluster-internal bearer for the ingest API
     web_session_secret: str = ""  # placeholder: web onboarding will sign its sessions with it
+    email_domain: str = "exiosv.com"  # the LiveTrack recipient domain: garmin-telegram+<token>@<domain>
+    site_url: str = ""        # the website shown in the /start menu; empty hides the button
     owner: str = "the rider"
 
     @classmethod
@@ -62,5 +64,7 @@ class Config:
             ingest_port=_int_env(e, "INGEST_PORT", 8080),
             ingest_token=e("INGEST_TOKEN", ""),
             web_session_secret=e("WEB_SESSION_SECRET", ""),
+            email_domain=e("EMAIL_DOMAIN", "exiosv.com"),
+            site_url=e("SITE_URL", ""),
             owner=e("OWNER_NAME", "the rider"),
         )

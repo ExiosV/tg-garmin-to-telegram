@@ -6,12 +6,10 @@ download is intentionally not ported (this service uploads no traces). The user'
 users.garmin_api_key (set during onboarding).
 Docs: developer.garmin.com/gc-developer-program/personal/personal-api."""
 import json
-import logging
 import threading
 
 import requests
 
-from .redact import redact
 
 
 BASE = "https://personal.connectapi.garmin.com"

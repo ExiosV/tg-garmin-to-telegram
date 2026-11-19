@@ -89,6 +89,7 @@ class State:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='rides'"
         ).fetchone()
         if rides_sql and "session_id TEXT UNIQUE" in (rides_sql[0] or ""):
+            self.db.execute("DROP TABLE IF EXISTS rides_new")
             self.db.execute("CREATE TABLE rides_new ("
                             "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT, "
                             "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, state TEXT DEFAULT 'started', "
@@ -233,6 +234,20 @@ class State:
     def set_user_state(self, user_id: int, state: str) -> None:
         with self._lock:
             self.db.execute("UPDATE users SET state=? WHERE user_id=?", (str(state), int(user_id)))
+            self.db.commit()
+
+    def set_own_bot_token(self, user_id: int, bot_token: str) -> None:
+        """Store the user's own bot token (validated via getMe before this call)."""
+        with self._lock:
+            self.db.execute("UPDATE users SET bot_token=? WHERE user_id=?",
+                            (str(bot_token), int(user_id)))
+            self.db.commit()
+
+    def set_garmin_key(self, user_id: int, api_key: str, name: str = "") -> None:
+        """Store the user's Garmin Personal API key (validated before this call)."""
+        with self._lock:
+            self.db.execute("UPDATE users SET garmin_api_key=?, garmin_name=? WHERE user_id=?",
+                            (str(api_key), str(name), int(user_id)))
             self.db.commit()
 
     def set_lang(self, user_id: int, lang: str) -> None:
