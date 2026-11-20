@@ -19,6 +19,8 @@ python3 -m venv .venv && .venv/bin/pip install -e .[dev]
 ```
 
 Docker: `docker build -t tg-garmin-to-telegram .` then `docker run --env-file .env tg-garmin-to-telegram run`.
+The image runs as the non-root user `app` (UID 10001) with the state in `DATA_DIR=/data` (mount a
+volume there, e.g. `-v gt-data:/data`).
 
 Reliability: an announcement is marked sent only after Telegram accepted it — after any outage the
 announcement goes out once at the next successful poll. A process restart between the send and the
