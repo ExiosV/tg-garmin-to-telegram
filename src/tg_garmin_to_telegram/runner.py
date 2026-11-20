@@ -436,6 +436,14 @@ def _match_ride_ends(state) -> None:
         for ride in started:
             act = match_activity(activities, ride["started_ts"] or 0)
             if act is None:
+                # No matching activity: if the ride started beyond MAX_RIDE_S ago, no activity can
+                # ever match (the interval cap) — force-close it so the buffered photos publish
+                # and nothing sits on disk forever.
+                if (ride["started_ts"] or 0) < now - MAX_RIDE_S:
+                    end = int(ride["started_ts"]) + MAX_RIDE_S
+                    state.set_ride_end(ride["session_id"], end)
+                    log.warning("ride %s force-closed after %d h without a matching activity",
+                                ride["session_id"], MAX_RIDE_S // 3600)
                 continue
             end = activity_end(act)
             if end is None:
@@ -465,11 +473,15 @@ def _publish_ended_rides(cfg, state, telegram_factory) -> None:
 
 def _ride_caption(user: dict, ride: dict) -> str:
     """The ride-end summary: rider name, km and the Garmin activity link (the announcement's
-    token-less LiveTrack link stands in when no activity id was matched)."""
+    token-less LiveTrack link stands in when no activity id was matched). The km segment is
+    omitted when the distance is unknown — a bare dash reads broken."""
     lang = user.get("lang")
     name = (user.get("garmin_name") or user.get("target_title")
             or i18n.text(lang, "default_name"))
-    km = f"{ride['distance_m'] / 1000:.1f}" if ride.get("distance_m") else "—"
+    km = ""
+    if ride.get("distance_m"):
+        unit = "км" if lang == i18n.RU else "km"
+        km = f" — {ride['distance_m'] / 1000:.1f} {unit}"
     link = (ACTIVITY_URL.format(activity_id=ride["activity_id"])
             if ride.get("activity_id") else (ride.get("live_url") or ""))
     return i18n.text(lang, "ride_ended", name=html.escape(str(name or "")), km=km,

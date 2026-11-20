@@ -272,6 +272,7 @@ def _started_ride(st, uid=5, ts=1000):
 def test_photo_buffers_file_and_replies(tmp_path, monkeypatch):
     st, f = State(str(tmp_path)), _Factory()
     cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     _started_ride(st)
     seen = []
 
@@ -280,6 +281,7 @@ def test_photo_buffers_file_and_replies(tmp_path, monkeypatch):
         return b"JPEGDATA"
 
     monkeypatch.setattr(onboarding, "_download_photo", fake_download)
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg())
     assert seen == ["fid_big"]  # the largest size is the one downloaded
     ride = st.get_ride("sess-1")
@@ -317,13 +319,16 @@ def test_photo_download_uses_the_bot_api_file_endpoint(tmp_path, monkeypatch):
 def test_no_active_ride_hint_once_per_window(tmp_path, monkeypatch):
     st, f = State(str(tmp_path)), _Factory()
     cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg())
     texts = [m["text"] for m in f.bot_for("999:REG").sent]
     assert any("Активной поездки" in t for t in texts)
     f.bot_for("999:REG").sent.clear()
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg(mid=61))
     assert f.bot_for("999:REG").sent == []  # a photo burst does not spam the hint
     st.set_meta("no_ride_note:5", str(int(time.time()) - 601))  # the window has passed
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg(mid=62))
     assert len(f.bot_for("999:REG").sent) == 1
 
@@ -335,6 +340,7 @@ def test_photo_too_big_is_refused(tmp_path, monkeypatch):
     called = []
     monkeypatch.setattr(onboarding, "_download_photo",
                         lambda c, b, fid: called.append(fid) or b"x")
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg())  # file_size 50000 > 1000
     assert called == []  # refused before any download
     ride = st.get_ride("sess-1")
@@ -351,6 +357,7 @@ def test_photo_limit_caps_per_ride(tmp_path, monkeypatch):
     st.add_photo(ride_id, "1.jpg")
     st.add_photo(ride_id, "2.jpg")
     monkeypatch.setattr(onboarding, "_download_photo", lambda c, b, fid: b"JPEGDATA")
+    st.touch_user(5); st.set_garmin_key(5, 'KEY', 'Igor')  # photos require a linked key
     onboarding.handle_photo(cfg, st, f, _photo_msg())
     assert st.count_photos(ride_id) == 2  # the third photo is not buffered
     texts = [m["text"] for m in f.bot_for("999:REG").sent]
@@ -360,9 +367,43 @@ def test_photo_limit_caps_per_ride(tmp_path, monkeypatch):
 def test_poll_once_routes_photo_messages(tmp_path, monkeypatch):
     st, f = State(str(tmp_path)), _Factory()
     cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    st.touch_user(5); st.set_garmin_key(5, "KEY", "Igor")  # photos require a linked key
     _started_ride(st)
     monkeypatch.setattr(onboarding, "_download_photo", lambda c, b, fid: b"JPEGDATA")
     f.bot_for("999:REG").canned_updates = [_update(30, message=_photo_msg())]
     onboarding.poll_once(cfg, st, f)
     assert st.count_photos(st.get_ride("sess-1")["ride_id"]) == 1
     assert st.get_meta("onb_offset") == "31"  # the offset advanced past the photo update
+
+
+def test_photos_refused_without_garmin_key(tmp_path):
+    """Without a Garmin key the ride end can never be detected: the photos are refused politely
+    instead of being stored forever."""
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg()
+    onboarding.handle_message(cfg, st, f, _msg(text="/start"))
+    st.start_ride(5, "s-live", "https://livetrack.garmin.com/session/s-live", None, 1)
+    onboarding.handle_photo(cfg, st, f, _photo_msg(uid=5, mid=90, sizes=[{"file_id": "f1", "width": 100, "height": 100}]))
+    sent = f.bot_for("999:REG").sent[-1]["text"]
+    assert "ключа Garmin" in sent
+    assert st.latest_started_ride(5) is not None  # the ride stays; only the photo is refused
+    assert not st.db.execute("SELECT COUNT(*) FROM photo_buf").fetchone()[0]
+
+
+def test_photo_buffer_cap_matches_album(tmp_path):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_max_per_ride=30)  # a misconfigured cap above the album limit is clamped
+    onboarding.handle_message(cfg, st, f, _msg(text="/start"))
+    st.set_own_bot_token(5, "111:U")
+    st.set_target(5, "own", "group", -100123, "R", "111:U")
+    st.set_user_state(5, "active")
+    st.set_garmin_key(5, "KEY", "Igor")
+    st.start_ride(5, "s1", "https://livetrack.garmin.com/session/s1", started_ts=1)
+    monkeypatch_download(onboarding, b"x")
+    for i in range(12):
+        onboarding.handle_photo(cfg, st, f, _photo_msg(uid=5, mid=100+i, sizes=[{"file_id": f"f{i}", "width": 100, "height": 100}]))
+    assert st.count_photos(st.latest_started_ride(5)["ride_id"]) == 10  # clamped to the album max
+
+
+def monkeypatch_download(mod, data):
+    mod._download_photo = lambda cfg, bot, file_id: data

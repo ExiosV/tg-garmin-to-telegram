@@ -15,7 +15,7 @@ MESSAGES = {
             "Garmin приходит на почту, и анонс появляется в вашей группе или канале в Telegram — от "
             "имени вашего собственного бота.\n\n"
             "📸 В альфа-версии доступно автоматическое добавление фото поездки в группу или в "
-            "обсуждение постов канала: пришлите фото боту во время поездки — альбом появится в треде "
+            "обсуждение постов канала: пришлите фото боту во время поездки — альбом появится в чате "
             "после её завершения.\n\n"
             "<b>Настройки</b>\n"
             "/lang ru|en — язык сообщений\n"
@@ -56,7 +56,7 @@ MESSAGES = {
         "chat_confirm": "👀 Вижу чат «{title}» ({kind}). Анонсы будут приходить сюда?",
         "chat_confirm_yes": "✅ Это тот чат",
         "target_set": "✅ Чат «{title}» подключён. Пришли тестовый анонс…",
-        "test_sent": "🧪 Тестовый анонс отправлен в «{title}». Теперь пришли фото поездки боту — в альфе они лягут в тред после её завершения.",
+        "test_sent": "🧪 Тестовый анонс отправлен в «{title}». Теперь пришли фото поездки боту — в альфе они лягут в чат после её завершения.",
         "service_bot_guide": (
             "✅ <b>Наш бот в твоей группе</b>\n"
             "Добавь @garmin_start_bot администратором в свою группу или канал — "
@@ -94,8 +94,12 @@ MESSAGES = {
         "photo_limit": "⚠️ Лимит — {n} фото на поездку. Это фото не сохранить.",
         "album_published": "🏁 Альбом поездки опубликован: {n} фото.",
         "ride_ended": (
-            "🏁 {name}: поездка завершена — {km} км\n"
+            "🏁 {name}: поездка завершена{km}\n"
             "🔗 <a href=\"{link}\">Активность в Garmin</a>"
+        ),
+        "photos_need_key": (
+            "📸 Фото принимаются после привязки ключа Garmin — по нему я узнаю конец поездки "
+            "и соберу альбом. Привяжи ключ кнопкой 🔑."
         ),
     },
     EN: {
@@ -105,7 +109,7 @@ MESSAGES = {
             "from a watched mailbox, and a notice appears in your own Telegram group or channel — "
             "sent as your own bot.\n\n"
             "📸 Alpha: ride photo albums are available — send the photos to the bot during the ride, "
-            "and the album lands in the thread after the ride ends.\n\n"
+            "and the album lands in your chat after the ride ends.\n\n"
             "<b>Settings</b>\n"
             "/lang ru|en — message language\n"
             "/help — help"
@@ -145,7 +149,7 @@ MESSAGES = {
         "chat_confirm": "👀 I see the chat “{title}” ({kind}). Should announcements go there?",
         "chat_confirm_yes": "✅ This is the chat",
         "target_set": "✅ Chat “{title}” connected. Sending a test announcement…",
-        "test_sent": "🧪 Test announcement sent to “{title}”. Send ride photos to the bot — in the alpha they land in the thread after the ride ends.",
+        "test_sent": "🧪 Test announcement sent to “{title}”. Send ride photos to the bot — in the alpha they land in your chat after the ride ends.",
         "service_bot_guide": (
             "✅ <b>Our bot in your group</b>\n"
             "Add @garmin_start_bot as an administrator to your group or channel — "
@@ -183,8 +187,12 @@ MESSAGES = {
         "photo_limit": "⚠️ The limit is {n} photos per ride. This one cannot be stored.",
         "album_published": "🏁 Ride album published: {n} photo(s).",
         "ride_ended": (
-            "🏁 {name}: the ride is over — {km} km\n"
+            "🏁 {name}: the ride is over{km}\n"
             "🔗 <a href=\"{link}\">Activity in Garmin</a>"
+        ),
+        "photos_need_key": (
+            "📸 Photos are accepted after a Garmin key is linked — it is how I detect the ride "
+            "end and assemble the album. Link the key with the 🔑 button."
         ),
     },
 }

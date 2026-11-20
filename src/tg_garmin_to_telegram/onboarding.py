@@ -28,6 +28,7 @@ from typing import Optional
 import requests
 
 from . import i18n
+from . import runner as runner_mod
 from . import photos as photos_mod
 from .garmin_api import GarminApiClient, GarminApiError, is_auth_error
 from .redact import redact
@@ -217,6 +218,11 @@ def handle_photo(cfg, state, bots, msg: dict) -> None:
     user = ensure_email_link(cfg, state, uid)
     lang = user.get("lang")
     bot = bots.bot_for(cfg.token)
+    if not user.get("garmin_api_key"):
+        # Without the key the ride end can never be detected, so the promised album can never be
+        # assembled: refuse politely instead of storing photos forever (the customer review).
+        _send(bot, uid, i18n.text(lang, "photos_need_key"))
+        return
     ride = state.latest_started_ride(uid)
     if ride is None:
         _no_ride_note(state, bot, uid, lang)
@@ -228,7 +234,7 @@ def handle_photo(cfg, state, bots, msg: dict) -> None:
     if (best.get("file_size") or 0) > cfg.photo_max_bytes:
         _send(bot, uid, i18n.text(lang, "photo_too_big", mb=cfg.photo_max_bytes // (1024 * 1024)))
         return
-    if state.count_photos(ride["ride_id"]) >= cfg.photo_max_per_ride:
+    if state.count_photos(ride["ride_id"]) >= min(cfg.photo_max_per_ride, runner_mod.PHOTO_ALBUM_MAX):
         _send(bot, uid, i18n.text(lang, "photo_limit", n=cfg.photo_max_per_ride))
         return
     data = _download_photo(cfg, bot, best["file_id"])

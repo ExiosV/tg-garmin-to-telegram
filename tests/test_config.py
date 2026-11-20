@@ -26,7 +26,7 @@ def test_defaults_on_empty_env(clean_env):
     assert cfg.max_age_hours == 12 and cfg.ingest_port == 8080
     assert cfg.ingest_token == "" and cfg.web_session_secret == ""
     assert cfg.photo_dir == "./data/photos"  # the photo buffer lives under DATA_DIR
-    assert cfg.photo_max_per_ride == 30 and cfg.photo_max_bytes == 8 * 1024 * 1024
+    assert cfg.photo_max_per_ride == 10 and cfg.photo_max_bytes == 8 * 1024 * 1024
     assert cfg.owner == "the rider"
 
 

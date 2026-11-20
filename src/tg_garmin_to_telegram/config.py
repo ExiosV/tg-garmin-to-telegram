@@ -70,7 +70,7 @@ class Config:
             email_domain=e("EMAIL_DOMAIN", "exiosv.com"),
             site_url=e("SITE_URL", ""),
             photo_dir=e("PHOTO_DIR", "") or os.path.join(e("DATA_DIR", "./data"), "photos"),
-            photo_max_per_ride=_int_env(e, "PHOTO_MAX_PER_RIDE", 30),
+            photo_max_per_ride=_int_env(e, "PHOTO_MAX_PER_RIDE", 10),
             photo_max_bytes=_int_env(e, "PHOTO_MAX_BYTES", 8 * 1024 * 1024),
             owner=e("OWNER_NAME", "the rider"),
         )
