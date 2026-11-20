@@ -76,9 +76,17 @@ def test_ping_unauthenticated(api):
 
 
 def test_metrics_unauthenticated(api):
+    """Prometheus text exposition: VictoriaMetrics scrapes this — the format must stay text/plain."""
     st, base = api
-    code, body = _get(base, "/metrics")
-    assert code == 200 and "users_total" in body and "rides_by_state" in body
+    st.start_ride(5, "s-metrics", "https://livetrack.garmin.com/session/s-metrics", None, 1)
+    req = urllib.request.Request(base + "/metrics")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        code = r.status
+        ctype = r.headers.get("Content-Type", "")
+        text = r.read().decode()
+    assert code == 200
+    assert "version=0.0.4" in ctype
+    assert "users_total" in text and 'rides_by_state{state="' in text
 
 
 def test_user_requires_bearer(api):
