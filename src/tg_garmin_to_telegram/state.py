@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -31,8 +32,12 @@ class State:
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS rides ("
                 "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT, "
-                "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, state TEXT DEFAULT 'started', "
-                "channel_msg_id INTEGER, discuss_msg_id INTEGER, activity_id TEXT)"
+                "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, "
+                # state: 'started' | 'ended' (matched, not yet published) | 'posted' (album/summary
+                # went out) | 'nophotos' (ended with nothing to publish) | 'expired' (reserved)
+                "state TEXT DEFAULT 'started', "
+                "channel_msg_id INTEGER, discuss_msg_id INTEGER, discuss_chat_id INTEGER, "
+                "activity_id TEXT, distance_m REAL)"
             )
             self.db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
             # Gmail message-id dedupe for the poll loop: a mail is marked seen only after its
@@ -44,6 +49,12 @@ class State:
                 "CREATE TABLE IF NOT EXISTS events ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts INTEGER, kind TEXT, data TEXT)"
             )
+            # Buffered ride photos (the alpha flow): rows point at files under PHOTO_DIR/<ride_id>/;
+            # the rows are removed when the album is published or the user is deleted.
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS photo_buf ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, ride_id INTEGER, path TEXT, ts INTEGER)"
+            )
             self._migrate()
             # Secondary indexes go after _migrate(): a legacy table may not have the columns yet,
             # and the rides rebuild above drops any index made before it. Per-user session dedupe:
@@ -51,6 +62,7 @@ class State:
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uix_rides_user_session ON rides(user_id, session_id)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_rides_user ON rides(user_id, started_ts)")
             self.db.execute("CREATE INDEX IF NOT EXISTS idx_events_user_ts ON events(user_id, ts DESC)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_photo_buf_ride ON photo_buf(ride_id)")
             self.db.commit()
 
     def _migrate(self) -> None:
@@ -110,7 +122,9 @@ class State:
             ("state", "TEXT DEFAULT 'started'"),
             ("channel_msg_id", "INTEGER"),
             ("discuss_msg_id", "INTEGER"),
+            ("discuss_chat_id", "INTEGER"),
             ("activity_id", "TEXT"),
+            ("distance_m", "REAL"),
         ):
             if name not in rides_cols:
                 self.db.execute(f"ALTER TABLE rides ADD COLUMN {name} {ddl}")
@@ -191,6 +205,23 @@ class State:
                 self.db.execute("UPDATE users SET lang=? WHERE user_id=?", (lang, int(user_id)))
             self.db.commit()
             return self.user(user_id)
+
+    def ensure_email_link(self, user_id: int, email_domain: str,
+                          chat_id: Optional[int] = None, lang: str = "") -> dict:
+        """First contact bookkeeping shared by the onboarding bot and the ingest API: make sure the
+        row exists, carries its personal LiveTrack address (garmin-telegram+<token>@<domain>) and
+        the given language. Keeps existing values on repeat contacts; returns the row."""
+        with self._lock:
+            self.touch_user(user_id,
+                            chat_id=chat_id if chat_id is not None else int(user_id),
+                            lang=lang)
+            u = self.user(user_id)
+            if not u.get("email_token"):
+                token = secrets.token_urlsafe(12)
+                addr = f"garmin-telegram+{token}@{email_domain}"
+                self.set_email_link(user_id, token, addr)
+                u = self.user(user_id)
+            return u
 
     def user_by_email_token(self, token: str) -> Optional[dict]:
         """The active user bound to this garmin-telegram+<token> recipient; setup users are invisible
@@ -285,6 +316,31 @@ class State:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def delete_user(self, user_id: int) -> list:
+        """Remove the user and everything bound to them (the ingest DELETE contract): the user row,
+        their rides, seen rows, events, buffered photos, and every meta key owned by them
+        (pending:<uid>, tg_offset:<uid>, gride_check:<uid>, future backfill keys). Returns the
+        removed ride ids so the caller can clean the photo files on disk."""
+        uid = int(user_id)
+        with self._lock:
+            ride_ids = [r["ride_id"] for r in
+                        self.db.execute("SELECT ride_id FROM rides WHERE user_id=?", (uid,))]
+            self.db.execute(
+                "DELETE FROM photo_buf WHERE ride_id IN (SELECT ride_id FROM rides WHERE user_id=?)",
+                (uid,),
+            )
+            self.db.execute("DELETE FROM rides WHERE user_id=?", (uid,))
+            self.db.execute("DELETE FROM seen WHERE user_id=?", (uid,))
+            self.db.execute("DELETE FROM events WHERE user_id=?", (uid,))
+            suffix = f":{uid}"  # per-user meta keys end with the uid after a colon
+            owned = [r["k"] for r in self.db.execute("SELECT k FROM meta")
+                     if r["k"].endswith(suffix)]
+            for k in owned:
+                self.db.execute("DELETE FROM meta WHERE k=?", (k,))
+            self.db.execute("DELETE FROM users WHERE user_id=?", (uid,))
+            self.db.commit()
+            return ride_ids
+
     # -- rides ----------------------------------------------------------------------------------------------------
     def start_ride(self, user_id: int, session_id: str, live_url: str,
                    channel_msg_id: Optional[int] = None, started_ts: Optional[int] = None) -> bool:
@@ -316,12 +372,17 @@ class State:
             self.db.commit()
             return cur.rowcount > 0
 
-    def set_discuss_msg(self, user_id: int, session_id: str, discuss_msg_id: int) -> bool:
-        """Attach the auto-forwarded copy in the linked discussion group (the thread root)."""
+    def set_discuss_msg(self, user_id: int, session_id: str, discuss_msg_id: int,
+                        discuss_chat_id: Optional[int] = None) -> bool:
+        """Attach the auto-forwarded copy in the linked discussion group (the thread root). The
+        group's chat id rides along: the album publish answers into that chat."""
         with self._lock:
             cur = self.db.execute(
-                "UPDATE rides SET discuss_msg_id=? WHERE user_id=? AND session_id=? AND discuss_msg_id IS NULL",
-                (int(discuss_msg_id), int(user_id), str(session_id)),
+                "UPDATE rides SET discuss_msg_id=?, discuss_chat_id=COALESCE(?, discuss_chat_id) "
+                "WHERE user_id=? AND session_id=? AND discuss_msg_id IS NULL",
+                (int(discuss_msg_id),
+                 int(discuss_chat_id) if discuss_chat_id is not None else None,
+                 int(user_id), str(session_id)),
             )
             self.db.commit()
             return cur.rowcount > 0
@@ -346,12 +407,14 @@ class State:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def set_ride_end(self, session_id: str, ended_ts: int) -> bool:
-        """Close a ride with the exact end from Garmin; only a 'started' ride transitions."""
+    def set_ride_end(self, session_id: str, ended_ts: int, distance_m: Optional[float] = None) -> bool:
+        """Close a ride with the exact end from Garmin; only a 'started' ride transitions.
+        distance_m is the matched activity's distance (the ride-end summary shows km)."""
         with self._lock:
             cur = self.db.execute(
-                "UPDATE rides SET ended_ts=?, state='ended' WHERE session_id=? AND state='started'",
-                (int(ended_ts), str(session_id)),
+                "UPDATE rides SET ended_ts=?, distance_m=?, state='ended' "
+                "WHERE session_id=? AND state='started'",
+                (int(ended_ts), float(distance_m) if distance_m is not None else None, str(session_id)),
             )
             self.db.commit()
             return cur.rowcount > 0
@@ -364,6 +427,36 @@ class State:
                 (str(activity_id), int(user_id), str(session_id)),
             )
             self.db.commit()
+
+    def set_ride_published(self, session_id: str) -> bool:
+        """'ended' -> 'posted' after the album (or the bare summary) went out; idempotent gate."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE rides SET state='posted' WHERE session_id=? AND state='ended'",
+                (str(session_id),),
+            )
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def set_ride_nophotos(self, session_id: str) -> bool:
+        """'ended' -> 'nophotos': the ride finished with no publishable photos."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE rides SET state='nophotos' WHERE session_id=? AND state='ended'",
+                (str(session_id),),
+            )
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def latest_started_ride(self, user_id: int) -> Optional[dict]:
+        """The user's newest ride still in the 'started' state (incoming photos attach to it)."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT * FROM rides WHERE user_id=? AND state='started' "
+                "ORDER BY started_ts DESC, ride_id DESC LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+            return dict(row) if row else None
 
     def user_rides(self, user_id: int, state: Optional[str] = None, limit: int = 50) -> list:
         """This user's rides, newest first; optional exact-state filter."""
@@ -379,6 +472,36 @@ class State:
                     (int(user_id), int(limit)),
                 ).fetchall()
             return [dict(r) for r in rows]
+
+    # -- photo buffer (alpha) -------------------------------------------------------------------------------------
+    def add_photo(self, ride_id: int, path: str) -> None:
+        """Record one buffered photo file (the row is the queue; the file lives on disk)."""
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO photo_buf(ride_id, path, ts) VALUES (?,?,?)",
+                (int(ride_id), str(path), int(time.time())),
+            )
+            self.db.commit()
+
+    def ride_photos(self, ride_id: int) -> list:
+        """Buffered photos of one ride, oldest first (the album keeps the arrival order)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM photo_buf WHERE ride_id=? ORDER BY ts, id", (int(ride_id),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def count_photos(self, ride_id: int) -> int:
+        with self._lock:
+            return self.db.execute(
+                "SELECT COUNT(*) FROM photo_buf WHERE ride_id=?", (int(ride_id),)
+            ).fetchone()[0]
+
+    def clear_photos(self, ride_id: int) -> None:
+        """Drop the buffered photo rows of one ride (the caller removes the files)."""
+        with self._lock:
+            self.db.execute("DELETE FROM photo_buf WHERE ride_id=?", (int(ride_id),))
+            self.db.commit()
 
     # -- events (per-user log) ------------------------------------------------------------------------------------
     def add_event(self, user_id: int, kind: str, data: dict) -> None:

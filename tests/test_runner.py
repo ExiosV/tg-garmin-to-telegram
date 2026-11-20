@@ -2,10 +2,14 @@
 State on tmp_path. No HTTP anywhere: the fake bots replace tg_botkit at the factory boundary."""
 import base64
 import time
+from datetime import datetime, timezone
 
 import pytest
 
+from tg_garmin_to_telegram import photos as photos_mod
+from tg_garmin_to_telegram import runner
 from tg_garmin_to_telegram.config import Config
+from tg_garmin_to_telegram.garmin_api import GarminApiError
 from google_kit.errors import GoogleError
 from tg_botkit.bot import TelegramError
 
@@ -28,25 +32,37 @@ def _msg(link, to=TO, internal_date=None):
 
 
 class _Bot:
-    """Duck-typed tg_botkit.Bot: records sends; getUpdates returns canned updates or raises."""
+    """Duck-typed tg_botkit.Bot: records sends and media groups; getUpdates returns canned updates."""
 
     def __init__(self, token):
         self.token = token
         self.sent = []
+        self.groups = []
         self.fail = 0
         self.fail_status = None  # set -> raise TelegramError with this HTTP status
         self.updates_error = None
         self.canned_updates = []
         self.update_calls = []
 
-    def send(self, text, chat_id=None, silent=False):
+    def send(self, text, chat_id=None, silent=False, reply_to=None, **kw):
         if self.fail_status:
             raise TelegramError("sendMessage", self.fail_status, "chat not found")
         if self.fail:
             self.fail -= 1
             raise RuntimeError("telegram down")
-        self.sent.append({"chat_id": chat_id, "text": text})
+        self.sent.append({"chat_id": chat_id, "text": text, "reply_to": reply_to})
         return 700 + len(self.sent)
+
+    def group(self, kind, items, caption="", chat_id=None, reply_to=None, **kw):
+        if self.fail_status:
+            raise TelegramError("sendMediaGroup", self.fail_status, "chat not found")
+        if self.fail:
+            self.fail -= 1
+            raise RuntimeError("telegram down")
+        self.groups.append({"kind": kind, "names": [n for n, _ in items],
+                            "bytes": [b for _, b in items], "caption": caption,
+                            "chat_id": chat_id, "reply_to": reply_to})
+        return [900 + len(self.groups) * 10 + i for i in range(len(items))]
 
     def updates(self, offset, wait=30, allowed=("message",)):
         self.update_calls.append(offset)
@@ -371,3 +387,208 @@ def test_pass1_crash_does_not_swallow_pass2(tmp_path):
         poll_once(cfg, gm, f, st)  # pass 1 dies at listing; the flag is already armed
     assert poll_once(cfg, gm, f, st) == 1  # pass 2 posts the mail instead of archiving it
     assert st.mail_seen("m1")
+
+
+# ---- F3: ride-end matching (donor constants and interval rules) ----------------------------------------------
+
+T0 = 1768000000  # a fixed epoch; the matching math is relative to it
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _act(start, elapsed, aid=42, distance=15000.0, **kw):
+    """A Garmin activity-list shaped activity covering [start, start + elapsed]."""
+    a = {"activityId": aid, "startTimeGMT": _iso(start), "elapsedDuration": elapsed,
+         "distance": distance}
+    a.update(kw)
+    return a
+
+
+class _Garmin:
+    """Duck-typed GarminApiClient: canned activities or a canned error; counts the calls."""
+
+    def __init__(self, activities=(), error=None):
+        self.activities = list(activities)
+        self.error = error
+        self.calls = 0
+
+    def recent_activities(self, limit=10):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.activities
+
+
+def _garmin_user(st, user_id=1, token="tok1", bot_token="111:AAA", target=-100123, key="GKEY"):
+    _user(st, user_id=user_id, token=token, bot_token=bot_token, target=target)
+    if key:
+        st.set_garmin_key(user_id, key, "Vespex")
+
+
+def _buffer_photos(st, cfg, ride_id, n):
+    """n buffered photos with real files on disk (the album publish reads them back)."""
+    for i in range(1, n + 1):
+        path = photos_mod.save(photos_mod.root(cfg), ride_id, i, b"photo%d" % i)
+        st.add_photo(ride_id, path)
+
+
+def test_match_activity_uses_donor_interval_rules():
+    # an activity in progress when the LiveTrack began, started within the window: matched
+    assert runner.match_activity([_act(T0 - 600, 3600)], T0) is not None
+    # started more than MATCH_BACK_S before the LiveTrack: a different (earlier) activity
+    assert runner.match_activity([_act(T0 - runner.MATCH_BACK_S - 1, 36000)], T0) is None
+    # started more than MATCH_FORWARD_S after the LiveTrack began: not this session
+    assert runner.match_activity([_act(T0 + runner.MATCH_FORWARD_S + 1, 600)], T0) is None
+    # already ended when the LiveTrack began: no match
+    assert runner.match_activity([_act(T0 - 7200, 3600)], T0) is None
+    # longer than MAX_RIDE_S is not a ride: no match
+    assert runner.match_activity([_act(T0 - 600, runner.MAX_RIDE_S + 1)], T0) is None
+    # any tracked type matches (the donor's ride was once saved as 'walking')
+    assert runner.match_activity([_act(T0 - 600, 3600, activityType="walking")], T0) is not None
+    # end_gmt wins over the start + elapsed math when present
+    assert runner.activity_end(_act(T0 - 600, 3600, end_gmt=_iso(T0 + 1800))) == T0 + 1800
+    # unparsable start: no interval, no match
+    assert runner.match_activity([{"startTimeGMT": "garbage", "elapsedDuration": 60}], T0) is None
+
+
+def test_match_activity_earliest_end_wins():
+    acts = [_act(T0 - 600, 7200, aid=1), _act(T0 - 300, 3600, aid=2)]
+    assert runner.activity_id(runner.match_activity(acts, T0)) == "2"
+
+
+def test_ride_end_closes_ride_and_sends_summary(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    g = _Garmin([_act(T0 - 600, 3600)])
+    monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
+    runner.poll_rides(Config(token="999:REG"), st, f)
+    ride = st.get_ride("abc-123")
+    # the same pass matches and publishes: the ride lands straight in 'nophotos'
+    assert ride["ended_ts"] == T0 - 600 + 3600
+    assert ride["activity_id"] == "42" and ride["distance_m"] == 15000.0
+    assert st.get_meta("gride_check:1") is not None  # the rate-limit window is stamped
+    # no photos buffered: the summary text goes to the target chat, the ride ends as 'nophotos'
+    sent = f.bot("111:AAA").sent
+    assert len(sent) == 1 and sent[0]["chat_id"] == -100123
+    assert "поездка завершена" in sent[0]["text"] and "15.0 км" in sent[0]["text"]
+    assert "connect.garmin.com/modern/activity/42" in sent[0]["text"]
+    assert ride["state"] == "nophotos"
+
+
+def test_rate_limit_one_garmin_check_per_window(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    g = _Garmin([])  # no matching activity: the ride stays started
+    monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
+    runner.poll_rides(Config(token="999:REG"), st, f)
+    assert g.calls == 1
+    st.start_ride(1, "second", CANONICAL + "2", 702, T0 + 60)  # new ride, same window
+    runner.poll_rides(Config(token="999:REG"), st, f)
+    assert g.calls == 1  # the window shields the Personal API
+
+
+def test_user_without_garmin_key_is_skipped(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    _user(st)  # active with a target, no Garmin key
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    g = _Garmin()
+    monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
+    runner.poll_rides(Config(token="999:REG"), st, f)
+    assert g.calls == 0 and st.get_ride("abc-123")["state"] == "started"
+
+
+def test_dead_key_adds_one_event_and_does_not_spam(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    g = _Garmin(error=GarminApiError("api key exchange failed", 401))
+    monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
+    runner.poll_rides(Config(token="999:REG"), st, f)
+    assert st.get_ride("abc-123")["state"] == "started"  # not closed on a dead key
+    assert [e["kind"] for e in st.events(1)].count("garmin_key_dead") == 1
+    assert f.bot("111:AAA") is None  # the user's bot was never touched: no album, no summary
+    runner.poll_rides(Config(token="999:REG"), st, f)  # second pass inside the window
+    assert g.calls == 1  # the window also gates the retry of a dead key
+    assert [e["kind"] for e in st.events(1)].count("garmin_key_dead") == 1
+
+
+def test_album_published_into_thread_and_buffer_cleared(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    cfg = Config(token="999:REG", photo_dir=str(tmp_path / "photos"))
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    st.set_discuss_msg(1, "abc-123", 42, discuss_chat_id=-100999)
+    ride_id = st.get_ride("abc-123")["ride_id"]
+    _buffer_photos(st, cfg, ride_id, 3)
+    g = _Garmin([_act(T0 - 600, 3600)])
+    monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
+    runner.poll_rides(cfg, st, f)
+    groups = f.bot("111:AAA").groups
+    assert len(groups) == 1
+    grp = groups[0]
+    assert grp["kind"] == "photo" and grp["names"] == ["1.jpg", "2.jpg", "3.jpg"]
+    assert grp["bytes"] == [b"photo1", b"photo2", b"photo3"]
+    assert grp["chat_id"] == -100999 and grp["reply_to"] == 42  # answered into the thread
+    assert "поездка завершена" in grp["caption"] and "activity/42" in grp["caption"]
+    assert st.get_ride("abc-123")["state"] == "posted"
+    assert st.count_photos(ride_id) == 0  # the buffer rows are gone
+    assert not (tmp_path / "photos" / str(ride_id)).exists()  # and the files with them
+    # the alpha loop is closed: one confirmation to the user's own chat with the reg bot
+    assert any("Альбом поездки опубликован" in m["text"]
+               for m in f.bot("999:REG").sent)
+
+
+def test_album_capped_at_first_ten_photos(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    cfg = Config(token="999:REG", photo_dir=str(tmp_path / "photos"))
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    ride_id = st.get_ride("abc-123")["ride_id"]
+    _buffer_photos(st, cfg, ride_id, 12)
+    monkeypatch.setattr(runner, "GarminApiClient",
+                        lambda key: _Garmin([_act(T0 - 600, 3600)]))
+    runner.poll_rides(cfg, st, f)
+    grp = f.bot("111:AAA").groups[0]
+    assert grp["names"] == [f"{i}.jpg" for i in range(1, 11)]  # the first 10 by arrival
+    assert st.get_ride("abc-123")["state"] == "posted"
+
+
+def test_photos_alpha_off_sends_summary_only(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    cfg = Config(token="999:REG", photo_dir=str(tmp_path / "photos"))
+    _garmin_user(st)
+    st.set_photos_alpha(1, False)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    ride_id = st.get_ride("abc-123")["ride_id"]
+    _buffer_photos(st, cfg, ride_id, 2)
+    monkeypatch.setattr(runner, "GarminApiClient",
+                        lambda key: _Garmin([_act(T0 - 600, 3600)]))
+    runner.poll_rides(cfg, st, f)
+    assert f.bot("111:AAA").groups == []  # no album for a user who opted out
+    assert "поездка завершена" in f.bot("111:AAA").sent[0]["text"]
+    assert st.get_ride("abc-123")["state"] == "nophotos"
+    assert st.count_photos(ride_id) == 0  # the orphaned buffer is cleaned too
+
+
+def test_album_send_failure_retries_next_pass(tmp_path, monkeypatch):
+    st, f = _initialized(tmp_path), _Factory()
+    cfg = Config(token="999:REG", photo_dir=str(tmp_path / "photos"))
+    _garmin_user(st)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    st.set_discuss_msg(1, "abc-123", 42, discuss_chat_id=-100999)
+    ride_id = st.get_ride("abc-123")["ride_id"]
+    _buffer_photos(st, cfg, ride_id, 2)
+    monkeypatch.setattr(runner, "GarminApiClient",
+                        lambda key: _Garmin([_act(T0 - 600, 3600)]))
+    f.bot_for("111:AAA").fail_status = 500  # the media group send fails transiently
+    runner.poll_rides(cfg, st, f)
+    assert st.get_ride("abc-123")["state"] == "ended"  # stays publishable
+    assert st.count_photos(ride_id) == 2  # the photos are kept for the retry
+    f.bot_for("111:AAA").fail_status = None
+    runner.poll_rides(cfg, st, f)  # the window blocks re-matching, publishing still runs
+    assert st.get_ride("abc-123")["state"] == "posted"
+    assert st.count_photos(ride_id) == 0

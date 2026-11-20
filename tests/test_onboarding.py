@@ -1,6 +1,7 @@
 """F1b onboarding tests: duck-typed bots, real SQLite on tmp_path. The service bot's getUpdates
 is canned; the Garmin validation is faked at the client boundary."""
 import json
+import time
 from datetime import datetime, timedelta
 
 import pytest
@@ -251,3 +252,117 @@ def test_redact_covers_bare_token(tmp_path):
     from tg_garmin_to_telegram.redact import redact
     out = redact("sendMessage: chat not found for 1234567:AAE_ab-XYZ_very_long_token_part")
     assert "1234567" not in out and "AAE_ab" not in out
+
+
+# ---- F3: the photo buffer (alpha) ---------------------------------------------------------------
+
+def _photo_msg(uid=5, mid=60, sizes=None):
+    """A Telegram photo message: several sizes, ascending (the largest carries the bytes)."""
+    return {"message_id": mid, "from": {"id": uid, "language_code": "ru"}, "chat": {"id": uid},
+            "photo": sizes or [
+                {"file_id": "fid_small", "width": 100, "height": 100, "file_size": 1000},
+                {"file_id": "fid_big", "width": 1200, "height": 900, "file_size": 50000},
+            ]}
+
+
+def _started_ride(st, uid=5, ts=1000):
+    st.start_ride(uid, "sess-1", "https://livetrack.garmin.com/session/s1", None, ts)
+
+
+def test_photo_buffers_file_and_replies(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    _started_ride(st)
+    seen = []
+
+    def fake_download(c, bot, file_id):
+        seen.append(file_id)
+        return b"JPEGDATA"
+
+    monkeypatch.setattr(onboarding, "_download_photo", fake_download)
+    onboarding.handle_photo(cfg, st, f, _photo_msg())
+    assert seen == ["fid_big"]  # the largest size is the one downloaded
+    ride = st.get_ride("sess-1")
+    assert st.count_photos(ride["ride_id"]) == 1
+    path = st.ride_photos(ride["ride_id"])[0]["path"]
+    with open(path, "rb") as fh:
+        assert fh.read() == b"JPEGDATA"
+    texts = [m["text"] for m in f.bot_for("999:REG").sent]
+    assert any("сохранено" in t for t in texts)
+
+
+def test_photo_download_uses_the_bot_api_file_endpoint(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(api_base="http://127.0.0.1:8081")
+    captured = {}
+
+    class _R:
+        status_code = 200
+        content = b"BYTES"
+
+    def fake_get(url, timeout=60):
+        captured["url"] = url
+        return _R()
+
+    monkeypatch.setattr(onboarding.requests, "get", fake_get)
+    bot = f.bot_for("999:REG")
+    monkeypatch.setattr(bot, "call",
+                        lambda method, **data: {"file_path": "photos/file_3.jpg"})
+    assert onboarding._download_photo(cfg, bot, "fid") == b"BYTES"
+    assert captured["url"].startswith("http://127.0.0.1:8081/file/bot999:REG/photos/file_3.jpg")
+    monkeypatch.setattr(_R, "status_code", 404)
+    assert onboarding._download_photo(cfg, bot, "fid") is None  # a bad status never raises
+
+
+def test_no_active_ride_hint_once_per_window(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    onboarding.handle_photo(cfg, st, f, _photo_msg())
+    texts = [m["text"] for m in f.bot_for("999:REG").sent]
+    assert any("Активной поездки" in t for t in texts)
+    f.bot_for("999:REG").sent.clear()
+    onboarding.handle_photo(cfg, st, f, _photo_msg(mid=61))
+    assert f.bot_for("999:REG").sent == []  # a photo burst does not spam the hint
+    st.set_meta("no_ride_note:5", str(int(time.time()) - 601))  # the window has passed
+    onboarding.handle_photo(cfg, st, f, _photo_msg(mid=62))
+    assert len(f.bot_for("999:REG").sent) == 1
+
+
+def test_photo_too_big_is_refused(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_dir=str(tmp_path / "photos"), photo_max_bytes=1000)
+    _started_ride(st)
+    called = []
+    monkeypatch.setattr(onboarding, "_download_photo",
+                        lambda c, b, fid: called.append(fid) or b"x")
+    onboarding.handle_photo(cfg, st, f, _photo_msg())  # file_size 50000 > 1000
+    assert called == []  # refused before any download
+    ride = st.get_ride("sess-1")
+    assert st.count_photos(ride["ride_id"]) == 0
+    texts = [m["text"] for m in f.bot_for("999:REG").sent]
+    assert any("больше" in t for t in texts)
+
+
+def test_photo_limit_caps_per_ride(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_dir=str(tmp_path / "photos"), photo_max_per_ride=2)
+    _started_ride(st)
+    ride_id = st.get_ride("sess-1")["ride_id"]
+    st.add_photo(ride_id, "1.jpg")
+    st.add_photo(ride_id, "2.jpg")
+    monkeypatch.setattr(onboarding, "_download_photo", lambda c, b, fid: b"JPEGDATA")
+    onboarding.handle_photo(cfg, st, f, _photo_msg())
+    assert st.count_photos(ride_id) == 2  # the third photo is not buffered
+    texts = [m["text"] for m in f.bot_for("999:REG").sent]
+    assert any("Лимит" in t for t in texts)
+
+
+def test_poll_once_routes_photo_messages(tmp_path, monkeypatch):
+    st, f = State(str(tmp_path)), _Factory()
+    cfg = _cfg(photo_dir=str(tmp_path / "photos"))
+    _started_ride(st)
+    monkeypatch.setattr(onboarding, "_download_photo", lambda c, b, fid: b"JPEGDATA")
+    f.bot_for("999:REG").canned_updates = [_update(30, message=_photo_msg())]
+    onboarding.poll_once(cfg, st, f)
+    assert st.count_photos(st.get_ride("sess-1")["ride_id"]) == 1
+    assert st.get_meta("onb_offset") == "31"  # the offset advanced past the photo update

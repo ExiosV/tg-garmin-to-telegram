@@ -45,8 +45,11 @@ def _metrics(state) -> dict:
     }
 
 
-def serve(port: int, token: str, state) -> ThreadingHTTPServer:
-    """Start the API server (caller passes it as a daemon thread). Refuses an empty token."""
+def serve(port: int, token: str, state, email_domain: str = "exiosv.com",
+          photos_root=None) -> ThreadingHTTPServer:
+    """Start the API server (caller passes it as a daemon thread). Refuses an empty token.
+    email_domain backs the /api/accounts/telegram address bookkeeping; photos_root (when given)
+    lets DELETE /api/users/<uid> wipe the buffered photo files too."""
     if not token:
         raise ValueError("INGEST_TOKEN is empty: refusing to start the ingest API without auth")
 
@@ -55,6 +58,8 @@ def serve(port: int, token: str, state) -> ThreadingHTTPServer:
 
     _Bound.token = token
     _Bound.state = state
+    _Bound.email_domain = email_domain
+    _Bound.photos_root = photos_root
     httpd = ThreadingHTTPServer(("0.0.0.0", port), _Bound)
     log.info("ingest API listening on :%s", port)
     return httpd
@@ -63,6 +68,8 @@ def serve(port: int, token: str, state) -> ThreadingHTTPServer:
 class _Handler(BaseHTTPRequestHandler):
     token = ""
     state = None
+    email_domain = "exiosv.com"
+    photos_root = None
 
     def log_message(self, fmt, *args):  # the default writes to stderr per request; keep it quiet
         pass
@@ -125,6 +132,19 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 self._json(400, {"ok": False, "error": "bad json"})
                 return
+            if self.path.rstrip("/") == "/api/accounts/telegram":
+                # The garmin-telegram-web contract (its PR #1): {uid, chat_id, lang} -> the account
+                # row with its personal LiveTrack address; the stripped row is the response.
+                uid = _as_int(payload.get("uid"))
+                if uid is None or uid <= 0:
+                    self._json(400, {"ok": False, "error": "uid must be a positive integer"})
+                    return
+                chat_id = _as_int(payload.get("chat_id"))
+                lang = payload.get("lang") if payload.get("lang") in ("ru", "en") else ""
+                user = self.state.ensure_email_link(uid, self.email_domain,
+                                                    chat_id=chat_id, lang=lang)
+                self._json(200, {"ok": True, "user": _strip(user)})
+                return
             if self.path.startswith("/api/users/") and self.path.rstrip("/").endswith("/target"):
                 uid = self._uid_from_suffix("/target")
                 row = self.state.user(uid) if uid is not None else None
@@ -163,6 +183,37 @@ class _Handler(BaseHTTPRequestHandler):
             return int(head.rsplit("/", 1)[-1])
         except (ValueError, IndexError):
             return None
+
+    def do_DELETE(self):  # noqa: N802
+        try:
+            if not self._authorized():
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if self.path.startswith("/api/users/"):
+                uid = self._uid()
+                row = self.state.user(uid) if uid is not None else None
+                if row is None:
+                    self._json(404, {"ok": False, "error": "unknown user"})
+                    return
+                ride_ids = self.state.delete_user(uid)
+                if self.photos_root is not None:
+                    from . import photos as photos_mod
+                    for rid in ride_ids:  # buffered files go with the rows
+                        photos_mod.clear_ride(self.photos_root, rid)
+                log.info("deleted user %s with %d ride(s)", uid, len(ride_ids))
+                self._json(200, {"ok": True})
+                return
+            self._json(404, {"ok": False, "error": "not found"})
+        except Exception as e:
+            log.error("ingest DELETE %s failed: %s", self.path, redact_safe(e))
+            self._json(500, {"ok": False, "error": "internal"})
+
+
+def _as_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def redact_safe(e: Exception) -> str:

@@ -89,7 +89,9 @@ def _start_ingest(cfg, state) -> None:
     """The ingest HTTP server as a daemon thread; a boot failure is fatal (the dashboard and the
     website would silently lose their data source otherwise)."""
     from . import ingest
-    httpd = ingest.serve(cfg.ingest_port, cfg.ingest_token, state)
+    from . import photos as photos_mod
+    httpd = ingest.serve(cfg.ingest_port, cfg.ingest_token, state,
+                         email_domain=cfg.email_domain, photos_root=photos_mod.root(cfg))
     threading.Thread(target=httpd.serve_forever, name="ingest", daemon=True).start()
 
 

@@ -88,6 +88,15 @@ MESSAGES = {
         "kind_group": "группа",
         "kind_channel": "канал",
         "dialog_cancelled": "Диалог отменён. /start — заново.",
+        "no_active_ride": "Активной поездки сейчас нет — фото можно прислать только во время поездки.",
+        "photo_saved": "✅ Фото сохранено — после завершения поездки попадёт в альбом.",
+        "photo_too_big": "❌ Фото больше {mb} МБ — такое не сохранить. Пришли файл поменьше.",
+        "photo_limit": "⚠️ Лимит — {n} фото на поездку. Это фото не сохранить.",
+        "album_published": "🏁 Альбом поездки опубликован: {n} фото.",
+        "ride_ended": (
+            "🏁 {name}: поездка завершена — {km} км\n"
+            "🔗 <a href=\"{link}\">Активность в Garmin</a>"
+        ),
     },
     EN: {
         "start": (
@@ -168,6 +177,15 @@ MESSAGES = {
         "kind_group": "group",
         "kind_channel": "channel",
         "dialog_cancelled": "Dialog cancelled. /start to begin again.",
+        "no_active_ride": "No active ride right now — photos can only be sent during a ride.",
+        "photo_saved": "✅ Photo saved — it will join the album when the ride ends.",
+        "photo_too_big": "❌ The photo is larger than {mb} MB — it cannot be stored. Send a smaller one.",
+        "photo_limit": "⚠️ The limit is {n} photos per ride. This one cannot be stored.",
+        "album_published": "🏁 Ride album published: {n} photo(s).",
+        "ride_ended": (
+            "🏁 {name}: the ride is over — {km} km\n"
+            "🔗 <a href=\"{link}\">Activity in Garmin</a>"
+        ),
     },
 }
 
