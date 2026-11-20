@@ -6,6 +6,6 @@ COPY src ./src
 RUN pip install --no-cache-dir . \
     && useradd -r -u 10001 app \
     && mkdir -p /data && chown app:app /data
-USER app
+USER 10001
 ENTRYPOINT ["python", "-m", "tg_garmin_to_telegram"]
 CMD ["run"]
