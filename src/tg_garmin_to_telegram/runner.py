@@ -406,19 +406,31 @@ def activity_id(a: dict) -> str:
     return str(a.get("activityId") or a.get("id") or "")
 
 
+def _force_close(state, ride: dict) -> None:
+    """Close a started ride that can no longer be matched: no activity ever arrives beyond the
+    interval cap, so the buffered photos must publish instead of sitting on disk forever."""
+    state.set_ride_end(ride["session_id"], int(ride["started_ts"] or 0) + MAX_RIDE_S)
+    log.warning("ride %s force-closed after %d h without a matching activity",
+                ride["session_id"], MAX_RIDE_S // 3600)
+
+
 def _match_ride_ends(state) -> None:
-    """Per active user with a Garmin key and started rides: one rate-limited recent_activities(30)
-    call, then interval-match every started ride. A match closes the ride (state 'ended') and
-    stores the activity id; the publish step of the same pass sends the album."""
+    """Per active user with started rides: stale rides (older than MAX_RIDE_S — no activity can
+    match beyond the interval cap) are force-closed so the buffered photos publish; fresh rides
+    of users with a Garmin key get one rate-limited recent_activities(30) check and interval-match.
+    A dead key force-closes that user's stale rides too (the photos must not sit forever)."""
+    now = int(time.time())
     for user in state.active_users():
         uid = user["user_id"]
-        if not user.get("garmin_api_key"):
-            continue
         started = state.user_rides(uid, state="started")
         if not started:
             continue
+        stale = [r for r in started if (r["started_ts"] or 0) < now - MAX_RIDE_S]
+        if not user.get("garmin_api_key"):
+            for ride in stale:  # no key: no activity can ever arrive — close the stale ones now
+                _force_close(state, ride)
+            continue
         key = RIDE_CHECK_PREFIX + str(uid)
-        now = int(time.time())
         if now - (_as_int(state.get_meta(key, "0")) or 0) < RIDE_CHECK_MIN_S:
             continue
         state.set_meta(key, str(now))  # burn the window first: one try per window, failures included
@@ -426,24 +438,20 @@ def _match_ride_ends(state) -> None:
             activities = GarminApiClient(user["garmin_api_key"]).recent_activities(30)
         except Exception as e:
             if is_auth_error(e):
-                # The key died (expired/revoked): one event for the user, no spam — the window
-                # above gates when the next check happens, and the event is not repeated.
+                # The key died (expired/revoked): one event for the user, no spam — and the stale
+                # rides close so the photos publish instead of sitting on disk forever.
                 state.add_event(uid, "garmin_key_dead", {"error": redact(str(e))})
                 log.error("garmin key rejected for user %s: %s", uid, redact(e))
+                for ride in stale:
+                    _force_close(state, ride)
             else:
                 log.warning("garmin activity check failed for user %s: %s", uid, redact(e))
             continue
         for ride in started:
             act = match_activity(activities, ride["started_ts"] or 0)
             if act is None:
-                # No matching activity: if the ride started beyond MAX_RIDE_S ago, no activity can
-                # ever match (the interval cap) — force-close it so the buffered photos publish
-                # and nothing sits on disk forever.
-                if (ride["started_ts"] or 0) < now - MAX_RIDE_S:
-                    end = int(ride["started_ts"]) + MAX_RIDE_S
-                    state.set_ride_end(ride["session_id"], end)
-                    log.warning("ride %s force-closed after %d h without a matching activity",
-                                ride["session_id"], MAX_RIDE_S // 3600)
+                if ride in stale:  # beyond the matching window: no activity can ever match it
+                    _force_close(state, ride)
                 continue
             end = activity_end(act)
             if end is None:

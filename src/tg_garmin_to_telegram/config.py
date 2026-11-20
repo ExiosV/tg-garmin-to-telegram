@@ -46,7 +46,7 @@ class Config:
     email_domain: str = "exiosv.com"  # the LiveTrack recipient domain: garmin-telegram+<token>@<domain>
     site_url: str = ""        # the website shown in the /start menu; empty hides the button
     photo_dir: str = ""       # PHOTO_DIR: photo buffer root; empty = DATA_DIR + "/photos" (photos.root)
-    photo_max_per_ride: int = 30      # buffered photos accepted per ride; extras are refused
+    photo_max_per_ride: int = 10      # buffered photos accepted per ride; extras are refused
     photo_max_bytes: int = 8 * 1024 * 1024  # one photo bigger than this is refused
     owner: str = "the rider"
 

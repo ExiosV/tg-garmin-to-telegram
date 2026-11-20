@@ -28,21 +28,22 @@ def _strip(row: Optional[dict]) -> Optional[dict]:
 _START = time.time()
 
 
-def _metrics(state) -> dict:
-    """Tiny process/service gauges; no user data."""
+def _metrics_text(state) -> str:
+    """Prometheus text exposition of the tiny process/service gauges; no user data. VictoriaMetrics
+    scrapes this endpoint — the format must stay text/plain version=0.0.4, not JSON."""
     import resource
+    lines = [
+        f"process_rss_bytes {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}",
+        f"process_uptime_seconds {round(time.time() - _START, 1)}",
+    ]
     try:
-        rides = {row["state"]: row["n"] for row in
-                 state.db.execute("SELECT state, COUNT(*) AS n FROM rides GROUP BY state")}
         users = state.db.execute("SELECT COUNT(*) AS n FROM users").fetchone()[0]
-    except Exception as e:  # metrics must never break the endpoint
-        rides, users = {}, -1
-    return {
-        "process_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
-        "process_uptime_seconds": round(time.time() - _START, 1),
-        "users_total": users,
-        "rides_by_state": rides,
-    }
+        lines.append(f"users_total {users}")
+        for row in state.db.execute("SELECT state, COUNT(*) AS n FROM rides GROUP BY state"):
+            lines.append(f'rides_by_state{{state="{row["state"]}"}} {row["n"]}')
+    except Exception:  # metrics must never break the endpoint
+        pass
+    return "\n".join(lines) + "\n"
 
 
 def serve(port: int, token: str, state, email_domain: str = "exiosv.com",
@@ -99,7 +100,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "ts": int(time.time())})
                 return
             if self.path == "/metrics":
-                self._json(200, _metrics(self.state))
+                body = _metrics_text(self.state).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if self.path.startswith("/api/") and not self._authorized():
                 self._json(401, {"ok": False, "error": "unauthorized"})
