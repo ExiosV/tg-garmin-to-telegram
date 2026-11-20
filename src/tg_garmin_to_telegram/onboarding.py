@@ -10,6 +10,8 @@ Walks a user from first contact to an active delivery target without any web UI:
   my_chat_member path on the service bot;
 - «Garmin key»: the user sends their Personal API key as a message (deleted immediately); it
   drives the ride-end matching later.
+- Photo messages (the alpha): buffered on disk against the user's latest started ride; the poll
+  loop publishes the album when the ride ends (runner.poll_rides).
 
 Every update is processed in its own guard and the offset advances even for unhandled updates,
 so one bad update never stops or replays the onboarding. The mail loop and this loop own
@@ -20,13 +22,14 @@ from __future__ import annotations
 import html
 import json
 import logging
-import secrets
 import time
 from typing import Optional
 
 import requests
 
 from . import i18n
+from . import runner as runner_mod
+from . import photos as photos_mod
 from .garmin_api import GarminApiClient, GarminApiError, is_auth_error
 from .redact import redact
 
@@ -34,6 +37,8 @@ log = logging.getLogger("tg_garmin_to_telegram")
 
 ONB_OFFSET = "onb_offset"
 PENDING_TTL_S = 600  # an unfinished dialog is abandoned after this long
+NO_RIDE_NOTE_S = 600  # the "no active ride" hint repeats at most once per this window
+NO_RIDE_NOTE_PREFIX = "no_ride_note:"  # meta key: last hint time per user
 
 STAGE_OWN_TOKEN = "onb_own_token"
 STAGE_OWN_CHAT = "onb_own_chat"
@@ -73,15 +78,9 @@ def _kbd(rows: list) -> str:
 
 
 def ensure_email_link(cfg, state, uid: int) -> dict:
-    """First contact: make sure the row exists and carries its personal LiveTrack address."""
-    u = state.user(uid)
-    if u is None or not u.get("email_token"):
-        token = secrets.token_urlsafe(12)
-        addr = f"garmin-telegram+{token}@{cfg.email_domain}"
-        state.touch_user(uid, chat_id=uid)
-        state.set_email_link(uid, token, addr)
-        u = state.user(uid)
-    return u
+    """First contact: make sure the row exists and carries its personal LiveTrack address.
+    The bookkeeping lives in State (the ingest API shares it)."""
+    return state.ensure_email_link(uid, cfg.email_domain, chat_id=uid)
 
 
 def _send(bot, chat_id, text: str, kbd: Optional[list] = None) -> None:
@@ -209,6 +208,79 @@ def handle_message(cfg, state, bots, msg: dict) -> None:
     _send(bot, uid, i18n.text(lang, "unknown", code=msg.get("from", {}).get("language_code")))
 
 
+def handle_photo(cfg, state, bots, msg: dict) -> None:
+    """One photo message in the service bot's chat (the alpha buffer flow): the largest Telegram
+    size is downloaded and buffered against the user's latest started ride; the runner turns the
+    buffer into the album when the ride ends. Never raises into the poll loop's caller."""
+    uid = _as_uid((msg.get("from") or {}).get("id"))
+    if uid is None:
+        return
+    user = ensure_email_link(cfg, state, uid)
+    lang = user.get("lang")
+    bot = bots.bot_for(cfg.token)
+    if not user.get("garmin_api_key"):
+        # Without the key the ride end can never be detected, so the promised album can never be
+        # assembled: refuse politely instead of storing photos forever (the customer review).
+        _send(bot, uid, i18n.text(lang, "photos_need_key"))
+        return
+    ride = state.latest_started_ride(uid)
+    if ride is None:
+        _no_ride_note(state, bot, uid, lang)
+        return
+    sizes = [s for s in (msg.get("photo") or []) if s.get("file_id")]
+    if not sizes:
+        return
+    best = max(sizes, key=lambda s: (s.get("width") or 0) * (s.get("height") or 0))
+    if (best.get("file_size") or 0) > cfg.photo_max_bytes:
+        _send(bot, uid, i18n.text(lang, "photo_too_big", mb=cfg.photo_max_bytes // (1024 * 1024)))
+        return
+    if state.count_photos(ride["ride_id"]) >= min(cfg.photo_max_per_ride, runner_mod.PHOTO_ALBUM_MAX):
+        _send(bot, uid, i18n.text(lang, "photo_limit", n=cfg.photo_max_per_ride))
+        return
+    data = _download_photo(cfg, bot, best["file_id"])
+    if data is None:
+        return  # a transient download failure: the user just sends the photo again
+    if len(data) > cfg.photo_max_bytes:  # Telegram may omit file_size: check the real bytes too
+        _send(bot, uid, i18n.text(lang, "photo_too_big", mb=cfg.photo_max_bytes // (1024 * 1024)))
+        return
+    n = state.count_photos(ride["ride_id"]) + 1
+    path = photos_mod.save(photos_mod.root(cfg), ride["ride_id"], n, data)
+    state.add_photo(ride["ride_id"], path)
+    log.info("buffered photo %d for ride %s (%d bytes)", n, ride["session_id"], len(data))
+    _send(bot, uid, i18n.text(lang, "photo_saved"))
+
+
+def _no_ride_note(state, bot, uid: int, lang: str) -> None:
+    """The 'no active ride' hint, at most once per NO_RIDE_NOTE_S: a photo burst must not spam."""
+    key = NO_RIDE_NOTE_PREFIX + str(uid)
+    now = int(time.time())
+    last = _as_int(state.get_meta(key, "0")) or 0
+    if now - last < NO_RIDE_NOTE_S:
+        return
+    state.set_meta(key, str(now))
+    _send(bot, uid, i18n.text(lang, "no_active_ride"))
+
+
+def _download_photo(cfg, bot, file_id: str) -> Optional[bytes]:
+    """The photo bytes via the bot-API file endpoint (local bot-api server when configured, else
+    api.telegram.org). The URL embeds the bot token: it is never logged."""
+    try:
+        info = bot.call("getFile", file_id=file_id)
+        path = (info or {}).get("file_path") if isinstance(info, dict) else None
+        if not path:
+            log.warning("photo getFile gave no file_path")
+            return None
+        url = f"{cfg.api_base}/file/bot{cfg.token}/{path}"
+        r = requests.get(url, timeout=60)
+        if r.status_code != 200:
+            log.warning("photo download failed: HTTP %s", r.status_code)
+            return None
+        return r.content
+    except Exception as e:  # network or Telegram-side failure: retryable by resending
+        log.warning("photo download failed: %s", redact(e))
+        return None
+
+
 def handle_callback(cfg, state, bots, cq: dict) -> None:
     """One inline-button press. Data: onb:address, onb:own_bot, onb:service_bot, onb:garmin_key,
     onb:status, onb:site, onb:chat_yes."""
@@ -313,7 +385,11 @@ def poll_once(cfg, state, bots) -> None:
         offset = max(offset, _as_int(update.get("update_id")) or 0) + 1
         try:
             if "message" in update:
-                handle_message(cfg, state, bots, update["message"])
+                msg = update["message"]
+                if msg.get("photo"):  # the alpha photo buffer flow (no text to parse)
+                    handle_photo(cfg, state, bots, msg)
+                else:
+                    handle_message(cfg, state, bots, msg)
             elif "callback_query" in update:
                 handle_callback(cfg, state, bots, update["callback_query"])
             elif "my_chat_member" in update:
