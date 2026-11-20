@@ -18,6 +18,14 @@ from .redact import redact
 log = logging.getLogger("tg_garmin_to_telegram")
 
 UPDATES_OFFSET_PREFIX = "tg_offset:"  # per-user Bot API offset in meta: tg_offset:<user_id>
+CHAT_MEMBER_HANDLER = None  # set by cli wiring: user bots' my_chat_member updates route to onboarding
+
+
+def set_chat_member_handler(fn) -> None:
+    """Register the onboarding handler for my_chat_member updates arriving on user bots (the bot
+    was added to a chat — the onboarding offers the confirmation). Never raises from the mail loop."""
+    global CHAT_MEMBER_HANDLER
+    CHAT_MEMBER_HANDLER = fn
 # Bot API statuses that mean the delivery target itself is misconfigured (bot kicked or blocked,
 # wrong chat id): retrying changes nothing, the mail is consumed and the user gets an event.
 PERMANENT_SEND_STATUSES = {400, 403}
@@ -159,7 +167,7 @@ def _process_mail(cfg, gmail, telegram_factory, state, pending: dict, mid, first
             # mail beats a 12-hour starvation of every other user; the user gets an event.
             state.mark_seen(mid, canonical, user["user_id"])
             state.add_event(user["user_id"], "delivery_failed",
-                            {"status": e.status, "description": e.description, "mail": str(mid)})
+                            {"status": e.status, "description": redact(e.description), "mail": str(mid)})
             log.error("permanent delivery failure for user %s (HTTP %s), mail consumed: %s",
                       user["user_id"], e.status, redact(e.description))
             return 0
@@ -183,10 +191,13 @@ def _process_mail(cfg, gmail, telegram_factory, state, pending: dict, mid, first
 
 
 def poll_discussions(telegram_factory, state) -> int:
-    """Best-effort thread discovery for delivery_mode='own' bots: read each such bot's getUpdates
-    once per pass and remember the auto-forwarded copy of the announcement (the thread root).
-    Channels without a linked discussion never produce one: discuss_msg_id stays NULL. 'our'-mode
-    users are skipped: the reg bot's getUpdates belongs to the onboarding iteration. Never raises."""
+    """Best-effort per-user bot getUpdates passes, never raising:
+    - active 'own'-mode users: thread discovery (the auto-forwarded copy of the announcement);
+    - setup 'own'-mode users: the my_chat_member watch that powers the own-bot chat confirmation
+      (a new user is not active yet — their bot's updates would otherwise never be read and the
+      promised "I will see the chat myself" would never fire).
+    'our'-mode users are skipped everywhere: the reg bot's getUpdates belongs to the onboarding
+    loop."""
     linked = 0
     for user in state.active_users():
         if user.get("delivery_mode") != "own":
@@ -197,7 +208,30 @@ def poll_discussions(telegram_factory, state) -> int:
             linked += _poll_user_discussion(telegram_factory, state, user)
         except Exception as e:  # a broken Telegram read must not stop mail polling
             log.error("discussion updates failed for user %s: %s", user["user_id"], redact(e))
+    for user in state.setup_own_users():
+        try:
+            _poll_setup_user_chat_member(telegram_factory, state, user)
+        except Exception as e:
+            log.error("chat-member watch failed for user %s: %s", user["user_id"], redact(e))
     return linked
+
+
+def _poll_setup_user_chat_member(telegram_factory, state, user: dict, wait: int = 1) -> None:
+    """One setup user's bot getUpdates pass watching for my_chat_member only. The onboarding
+    handler consumes it (the chat confirmation); the offset lives in meta like the discovery one."""
+    key = UPDATES_OFFSET_PREFIX + str(user["user_id"])
+    offset = _as_int(state.get_meta(key, "0")) or 0
+    bot = telegram_factory.bot_for(user["bot_token"])
+    updates = bot.updates(offset, wait=wait, allowed=("my_chat_member",))
+    for update in updates:
+        offset = max(offset, _as_int(update.get("update_id")) or 0) + 1
+        if "my_chat_member" in update and CHAT_MEMBER_HANDLER is not None:
+            try:
+                CHAT_MEMBER_HANDLER(state, update)
+            except Exception as e:  # onboarding failures never break the watch
+                log.error("chat-member handling failed for user %s: %s", user["user_id"], redact(e))
+    if updates:
+        state.set_meta(key, str(offset))
 
 
 def _poll_user_discussion(telegram_factory, state, user: dict, wait: int = 1) -> int:
@@ -206,11 +240,17 @@ def _poll_user_discussion(telegram_factory, state, user: dict, wait: int = 1) ->
     key = UPDATES_OFFSET_PREFIX + str(user["user_id"])
     offset = _as_int(state.get_meta(key, "0")) or 0
     bot = telegram_factory.bot_for(user["bot_token"])
-    updates = bot.updates(offset, wait=wait, allowed=("message",))
+    updates = bot.updates(offset, wait=wait, allowed=("message", "my_chat_member"))
     target = _as_int(user["target_id"])
     linked = 0
     for update in updates:
         offset = max(offset, _as_int(update.get("update_id")) or 0) + 1
+        if "my_chat_member" in update and CHAT_MEMBER_HANDLER is not None:
+            try:
+                CHAT_MEMBER_HANDLER(state, update)
+            except Exception as e:  # onboarding failures never break thread discovery
+                log.error("chat-member handling failed for user %s: %s", user["user_id"], redact(e))
+            continue
         msg = update.get("message") or {}
         if not msg.get("is_automatic_forward"):
             continue

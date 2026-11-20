@@ -89,6 +89,7 @@ class State:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='rides'"
         ).fetchone()
         if rides_sql and "session_id TEXT UNIQUE" in (rides_sql[0] or ""):
+            self.db.execute("DROP TABLE IF EXISTS rides_new")
             self.db.execute("CREATE TABLE rides_new ("
                             "ride_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, session_id TEXT, "
                             "live_url TEXT, started_ts INTEGER, ended_ts INTEGER, state TEXT DEFAULT 'started', "
@@ -235,6 +236,20 @@ class State:
             self.db.execute("UPDATE users SET state=? WHERE user_id=?", (str(state), int(user_id)))
             self.db.commit()
 
+    def set_own_bot_token(self, user_id: int, bot_token: str) -> None:
+        """Store the user's own bot token (validated via getMe before this call)."""
+        with self._lock:
+            self.db.execute("UPDATE users SET bot_token=? WHERE user_id=?",
+                            (str(bot_token), int(user_id)))
+            self.db.commit()
+
+    def set_garmin_key(self, user_id: int, api_key: str, name: str = "") -> None:
+        """Store the user's Garmin Personal API key (validated before this call)."""
+        with self._lock:
+            self.db.execute("UPDATE users SET garmin_api_key=?, garmin_name=? WHERE user_id=?",
+                            (str(api_key), str(name), int(user_id)))
+            self.db.commit()
+
     def set_lang(self, user_id: int, lang: str) -> None:
         with self._lock:
             self.db.execute("UPDATE users SET lang=? WHERE user_id=?", (str(lang), int(user_id)))
@@ -247,6 +262,17 @@ class State:
                 "UPDATE users SET photos_alpha=? WHERE user_id=?", (1 if flag else 0, int(user_id))
             )
             self.db.commit()
+
+    def setup_own_users(self) -> list:
+        """Users in the middle of the own-bot onboarding: they linked a bot token and wait for the
+        my_chat_member update that tells us which chat the bot was added to. The chat-confirm poll
+        loop reads exactly these bots (their getUpdates is otherwise unconsumed)."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM users WHERE state='setup' AND delivery_mode='own' "
+                "AND bot_token IS NOT NULL AND bot_token != '' ORDER BY user_id"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def active_users(self) -> list:
         """Users whose delivery is fully configured: a concrete target chat plus either their own
