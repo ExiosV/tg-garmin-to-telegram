@@ -491,14 +491,20 @@ def test_rate_limit_one_garmin_check_per_window(tmp_path, monkeypatch):
     assert g.calls == 1  # the window shields the Personal API
 
 
-def test_user_without_garmin_key_is_skipped(tmp_path, monkeypatch):
+def test_user_without_garmin_key_stale_ride_force_closed(tmp_path, monkeypatch):
+    """The reworked semantics (the customer round-1 [must]): without a key no activity can ever
+    arrive, so a stale ride force-closes and publishes instead of sitting forever; a fresh ride
+    stays open. No Garmin call is made for a keyless user."""
     st, f = _initialized(tmp_path), _Factory()
     _user(st)  # active with a target, no Garmin key
-    st.start_ride(1, "abc-123", CANONICAL, 701, T0)
+    st.start_ride(1, "abc-123", CANONICAL, 701, T0)          # stale (T0 is days back)
+    st.start_ride(1, "fresh-1", CANONICAL, 702, int(time.time()))
     g = _Garmin()
     monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
     runner.poll_rides(Config(token="999:REG"), st, f)
-    assert g.calls == 0 and st.get_ride("abc-123")["state"] == "started"
+    assert g.calls == 0  # a keyless user is never billed a Garmin call
+    assert st.get_ride("abc-123")["state"] == "nophotos"    # force-closed and published (empty)
+    assert st.get_ride("fresh-1")["state"] == "started"     # the fresh ride stays open
 
 
 def test_dead_key_adds_one_event_and_does_not_spam(tmp_path, monkeypatch):
@@ -508,9 +514,11 @@ def test_dead_key_adds_one_event_and_does_not_spam(tmp_path, monkeypatch):
     g = _Garmin(error=GarminApiError("api key exchange failed", 401))
     monkeypatch.setattr(runner, "GarminApiClient", lambda key: g)
     runner.poll_rides(Config(token="999:REG"), st, f)
-    assert st.get_ride("abc-123")["state"] == "started"  # not closed on a dead key
+    # the dead key force-closes the stale ride (the photos must not sit forever)
+    assert st.get_ride("abc-123")["state"] == "nophotos"
     assert [e["kind"] for e in st.events(1)].count("garmin_key_dead") == 1
-    assert f.bot("111:AAA") is None  # the user's bot was never touched: no album, no summary
+    # the summary still goes out through the user's bot (no album: nothing was buffered)
+    assert len(f.bot("111:AAA").sent) == 1
     runner.poll_rides(Config(token="999:REG"), st, f)  # second pass inside the window
     assert g.calls == 1  # the window also gates the retry of a dead key
     assert [e["kind"] for e in st.events(1)].count("garmin_key_dead") == 1

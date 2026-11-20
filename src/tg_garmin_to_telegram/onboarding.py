@@ -234,9 +234,12 @@ def handle_photo(cfg, state, bots, msg: dict) -> None:
     if (best.get("file_size") or 0) > cfg.photo_max_bytes:
         _send(bot, uid, i18n.text(lang, "photo_too_big", mb=cfg.photo_max_bytes // (1024 * 1024)))
         return
-    if state.count_photos(ride["ride_id"]) >= min(cfg.photo_max_per_ride, runner_mod.PHOTO_ALBUM_MAX):
-        _send(bot, uid, i18n.text(lang, "photo_limit", n=cfg.photo_max_per_ride))
+    cap = min(cfg.photo_max_per_ride, runner_mod.PHOTO_ALBUM_MAX)
+    if state.count_photos(ride["ride_id"]) >= cap:
+        _send(bot, uid, i18n.text(lang, "photo_limit", n=cap))
         return
+    if not user.get("photos_alpha", 1):
+        return  # the alpha opt-out: silently skip the buffer (the flag has no UI yet)
     data = _download_photo(cfg, bot, best["file_id"])
     if data is None:
         return  # a transient download failure: the user just sends the photo again
